@@ -43,6 +43,11 @@ MAX_PERMITTED_DATA_INCREASE = 10_240
 TRANSACTION_ACCOUNT_BASE_SIZE = 64
 MAX_INSTRUCTION_DATA_LEN = 10_240
 RENT_EXEMPT_RENT_EPOCH = (1 << 64) - 1
+DEFAULT_SLOTS_PER_EPOCH = 32
+MARKET_PRICE_SCALE = 1_000_000
+CONSTANT_PRODUCT_SWAP_FEE_BPS = 30
+STABLE_SWAP_FEE_BPS = 4
+WEIGHTED_SWAP_FEE_BPS = 20
 
 LEGACY_TRANSACTION_FORMAT = "legacy"
 VERSIONED_V0_TRANSACTION_FORMAT = "v0"
@@ -464,6 +469,64 @@ def encode_market_swap_data(
     return list(struct.pack("<BBQQQ", side_flag, order_type_flag, base_amount, quote_amount_limit, limit_price))
 
 
+def decode_system_transfer_data(data: list[int]) -> dict[str, int]:
+    discriminator, lamports = struct.unpack("<IQ", bytes(data))
+    if discriminator != 2:
+        raise ValueError("unsupported system instruction discriminator")
+    return {"lamports": lamports}
+
+
+def decode_pool_swap_data(data: list[int]) -> dict[str, int | str]:
+    swap_mode_flag, amount, other_amount_threshold = struct.unpack("<BQQ", bytes(data))
+    if swap_mode_flag == 0:
+        swap_mode = SWAP_MODE_EXACT_INPUT
+    elif swap_mode_flag == 1:
+        swap_mode = SWAP_MODE_EXACT_OUTPUT
+    else:
+        raise ValueError("unsupported pool swap mode flag")
+    return {
+        "swap_mode": swap_mode,
+        "amount": amount,
+        "other_amount_threshold": other_amount_threshold,
+    }
+
+
+def decode_pool_liquidity_add_data(data: list[int]) -> dict[str, int]:
+    max_token_a_amount, max_token_b_amount, min_lp_tokens_out = struct.unpack("<QQQ", bytes(data))
+    return {
+        "max_token_a_amount": max_token_a_amount,
+        "max_token_b_amount": max_token_b_amount,
+        "min_lp_tokens_out": min_lp_tokens_out,
+    }
+
+
+def decode_market_swap_data(data: list[int]) -> dict[str, int | str]:
+    side_flag, order_type_flag, base_amount, quote_amount_limit, limit_price = struct.unpack(
+        "<BBQQQ", bytes(data)
+    )
+    if side_flag == 0:
+        side = MARKET_SIDE_BUY
+    elif side_flag == 1:
+        side = MARKET_SIDE_SELL
+    else:
+        raise ValueError("unsupported market side flag")
+
+    if order_type_flag == 0:
+        order_type = MARKET_ORDER_TYPE_MARKET
+    elif order_type_flag == 1:
+        order_type = MARKET_ORDER_TYPE_LIMIT
+    else:
+        raise ValueError("unsupported market order type flag")
+
+    return {
+        "side": side,
+        "order_type": order_type,
+        "base_amount": base_amount,
+        "quote_amount_limit": quote_amount_limit,
+        "limit_price": limit_price,
+    }
+
+
 def build_market_swap_instruction(
     trader_authority: str,
     trader_base_account: str,
@@ -631,6 +694,61 @@ def build_market_definition(
         "oracle_account": oracle_account,
         "base_symbol": base_symbol,
         "quote_symbol": quote_symbol,
+    }
+
+
+def build_validator_profile(
+    validator_id: str,
+    identity_account: str,
+    vote_account: str,
+    activated_stake_lamports: int,
+    self_stake_lamports: int = 0,
+    commission_bps: int = 0,
+    delegator_count: int = 0,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Build a simplified validator registry entry.
+
+    Validators are network participants that receive transaction flow, produce blocks, and later
+    can participate in stake-weighted leader selection and consensus logic.
+
+    For a more Solana-like PoS model, it is important to separate the validator itself from the
+    stake delegated to it:
+    - the identity account represents the validator operator
+    - the vote account is the on-chain account that receives delegated stake
+    - activated stake is the currently effective stake weight behind that vote account
+
+    Real Solana staking uses separate stake accounts with stake / withdraw authorities and epoch
+    warmup-cooldown behavior. This validator object is therefore a summary view, not the full
+    stake-account model, but it now keeps the fields you will want later for PoS scheduling.
+    """
+    if self_stake_lamports > activated_stake_lamports:
+        raise ValueError("self_stake_lamports cannot exceed activated_stake_lamports")
+
+    return {
+        "validator_id": validator_id,
+        "identity_account": identity_account,
+        "vote_account": vote_account,
+        "activated_stake_lamports": activated_stake_lamports,
+        "self_stake_lamports": self_stake_lamports,
+        "delegated_stake_lamports": activated_stake_lamports - self_stake_lamports,
+        "activating_stake_lamports": 0,
+        "deactivating_stake_lamports": 0,
+        # Keep the old name as a compatibility alias while the rest of the simulator still grows.
+        "stake_lamports": activated_stake_lamports,
+        "commission_bps": commission_bps,
+        "delegator_count": delegator_count,
+        "fees_earned_lamports": 0,
+        "staking_rewards_earned_lamports": 0,
+        "produced_block_count": 0,
+        "last_produced_slot": None,
+        "last_vote_slot": None,
+        "root_slot": None,
+        "epoch_credits": [],
+        "is_delinquent": False,
+        "status": "active",
+        "metadata": metadata or {},
     }
 
 
@@ -940,7 +1058,7 @@ def generate_liquidity_provider_intents(
             venue_id="volatile_sol_usdc",
             parameters={
                 "max_token_amounts": [400_000_000, 900_000_000],
-                "min_lp_tokens_out": 150_000_000,
+                "min_lp_tokens_out": 9_500_000,
                 "lp_receipt_account": make_address("cp_lp_receipt_account"),
             },
             execution_preferences={
@@ -1060,7 +1178,7 @@ def generate_router_intents(
                 "destination_symbol": "USDT",
                 "swap_mode": SWAP_MODE_EXACT_OUTPUT,
                 "amount": 100_000_000,
-                "other_amount_threshold": 100_200_000,
+                "other_amount_threshold": 101_000_000,
             },
             execution_preferences={
                 "message_format": VERSIONED_V0_TRANSACTION_FORMAT,
@@ -1096,7 +1214,7 @@ def generate_rebalancer_intents(
                 "destination_symbol": "SOL",
                 "swap_mode": SWAP_MODE_EXACT_INPUT,
                 "amount": 180_000_000,
-                "other_amount_threshold": 75_000_000,
+                "other_amount_threshold": 58_000_000,
             },
             execution_preferences={
                 "message_format": VERSIONED_V0_TRANSACTION_FORMAT,
@@ -1699,7 +1817,12 @@ def create_block(
         "created_at_ms": now_ms(),
         "parent_block_hash": parent_block_hash,
         "transaction_count": len(transactions),
-        "total_fees_lamports": sum(tx["meta"]["fee_lamports"] for tx in transactions),
+        "confirmed_transaction_count": sum(tx["status"] == "confirmed" for tx in transactions),
+        "rejected_transaction_count": sum(tx["status"] == "rejected" for tx in transactions),
+        "total_fees_lamports": sum(
+            tx["meta"].get("fee_charged_lamports", tx["meta"]["fee_lamports"])
+            for tx in transactions
+        ),
         "transactions": deepcopy(transactions),
     }
     block["block_hash"] = stable_hash(block)
@@ -1709,6 +1832,679 @@ def create_block(
         transaction["block_hash"] = block["block_hash"]
 
     return block
+
+
+def get_required_account(accounts: dict[str, dict[str, Any]], pubkey: str) -> dict[str, Any]:
+    account = accounts.get(pubkey)
+    if account is None:
+        raise ValueError(f"missing account: {pubkey}")
+    return account
+
+
+def ensure_account_state(
+    accounts: dict[str, dict[str, Any]],
+    pubkey: str,
+    owner: str,
+) -> dict[str, Any]:
+    account = accounts.get(pubkey)
+    if account is None:
+        account = build_account_state(lamports=0, owner=owner, data=[])
+        accounts[pubkey] = account
+    return account
+
+
+def record_account_activity(account: dict[str, Any], marker: int) -> None:
+    account["data"].append(marker & 0xFF)
+
+
+def fee_bps_for_pool(pool: dict[str, Any]) -> int:
+    if pool["pool_type"] == POOL_TYPE_CONSTANT_PRODUCT:
+        return CONSTANT_PRODUCT_SWAP_FEE_BPS
+    if pool["pool_type"] == POOL_TYPE_STABLE_SWAP:
+        return STABLE_SWAP_FEE_BPS
+    return WEIGHTED_SWAP_FEE_BPS
+
+
+def pool_output_for_exact_input(
+    pool: dict[str, Any],
+    source_reserve: int,
+    destination_reserve: int,
+    source_index: int,
+    destination_index: int,
+    net_input_amount: int,
+) -> int:
+    if net_input_amount <= 0 or source_reserve <= 0 or destination_reserve <= 0:
+        return 0
+
+    if pool["pool_type"] == POOL_TYPE_CONSTANT_PRODUCT:
+        return (destination_reserve * net_input_amount) // (source_reserve + net_input_amount)
+
+    if pool["pool_type"] == POOL_TYPE_STABLE_SWAP:
+        amplification_factor = max(pool.get("amplification_factor") or 1, 1)
+        numerator = destination_reserve * net_input_amount * amplification_factor
+        denominator = source_reserve * amplification_factor + net_input_amount
+        return min(destination_reserve, numerator // max(denominator, 1))
+
+    weight_in = pool["normalized_weights_bps"][source_index] / 10_000
+    weight_out = pool["normalized_weights_bps"][destination_index] / 10_000
+    base_ratio = source_reserve / (source_reserve + net_input_amount)
+    output = destination_reserve * (1 - (base_ratio ** (weight_in / max(weight_out, 1e-9))))
+    return max(0, min(destination_reserve, int(output)))
+
+
+def required_input_for_exact_output(
+    pool: dict[str, Any],
+    source_reserve: int,
+    destination_reserve: int,
+    source_index: int,
+    destination_index: int,
+    desired_output_amount: int,
+    max_total_input_amount: int,
+) -> tuple[int, int] | None:
+    if desired_output_amount <= 0 or desired_output_amount >= destination_reserve:
+        return None
+
+    fee_bps = fee_bps_for_pool(pool)
+    low = 1
+    high = max_total_input_amount
+    best_total_input = None
+    best_net_input = None
+
+    while low <= high:
+        mid = (low + high) // 2
+        fee_amount = (mid * fee_bps) // 10_000
+        if fee_amount >= mid:
+            fee_amount = max(mid - 1, 0)
+        net_input_amount = mid - fee_amount
+        output_amount = pool_output_for_exact_input(
+            pool=pool,
+            source_reserve=source_reserve,
+            destination_reserve=destination_reserve,
+            source_index=source_index,
+            destination_index=destination_index,
+            net_input_amount=net_input_amount,
+        )
+        if output_amount >= desired_output_amount:
+            best_total_input = mid
+            best_net_input = net_input_amount
+            high = mid - 1
+        else:
+            low = mid + 1
+
+    if best_total_input is None or best_net_input is None:
+        return None
+    return best_total_input, best_net_input
+
+
+def estimate_market_quote_amount(
+    side: str,
+    order_type: str,
+    base_amount: int,
+    quote_amount_limit: int,
+    limit_price: int,
+) -> int:
+    if base_amount <= 0:
+        return 0
+
+    if order_type == MARKET_ORDER_TYPE_MARKET or limit_price == 0:
+        return quote_amount_limit
+
+    price_based_quote_amount = max(1, (base_amount * limit_price) // MARKET_PRICE_SCALE)
+    if side == MARKET_SIDE_BUY:
+        return min(quote_amount_limit, price_based_quote_amount)
+    return max(quote_amount_limit, price_based_quote_amount)
+
+
+def refresh_runtime_views(blockchain_state: dict[str, Any]) -> None:
+    accounts = blockchain_state["accounts"]
+
+    for pool in blockchain_state["pools"].values():
+        runtime_state = pool.setdefault("runtime_state", {})
+        runtime_state.setdefault("swap_count", 0)
+        runtime_state.setdefault("liquidity_add_count", 0)
+        runtime_state["last_observed_reserves"] = [
+            get_required_account(accounts, vault_account)["lamports"]
+            for vault_account in pool["pool_vault_accounts"]
+        ]
+        runtime_state["lp_supply"] = get_required_account(accounts, pool["pool_lp_mint"])["lamports"]
+        runtime_state["fee_vault_balance"] = get_required_account(accounts, pool["pool_fee_vault"])[
+            "lamports"
+        ]
+
+    for market in blockchain_state["markets"].values():
+        runtime_state = market.setdefault("runtime_state", {})
+        runtime_state.setdefault("trade_count", 0)
+        runtime_state.setdefault("base_volume", 0)
+        runtime_state.setdefault("quote_volume", 0)
+        runtime_state.setdefault("last_trade_price", None)
+        runtime_state["base_vault_balance"] = get_required_account(
+            accounts, market["base_vault_account"]
+        )["lamports"]
+        runtime_state["quote_vault_balance"] = get_required_account(
+            accounts, market["quote_vault_account"]
+        )["lamports"]
+
+
+def build_blockchain_state(
+    accounts: dict[str, dict[str, Any]],
+    pools: dict[str, dict[str, Any]],
+    markets: dict[str, dict[str, Any]],
+    players: dict[str, dict[str, Any]],
+    validators: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """
+    Build the persistent simulation state for the blockchain.
+
+    This is the missing layer between one-off block creation and a running chain. It stores the
+    live account state, venue definitions, registered players and validators, the pending request
+    queue, and the ordered block history.
+    """
+    genesis_hash = stable_hash(
+        {
+            "accounts": accounts,
+            "pools": pools,
+            "markets": markets,
+            "players": players,
+            "validators": validators or {},
+        }
+    )
+    blockchain_state = {
+        "chain_id": make_id("chain"),
+        "genesis_hash": genesis_hash,
+        "head_block_hash": genesis_hash,
+        "head_slot": 0,
+        "next_slot": 1,
+        "current_epoch": 0,
+        "epoch_schedule": {"slots_per_epoch": DEFAULT_SLOTS_PER_EPOCH},
+        "accounts": deepcopy(accounts),
+        "pools": deepcopy(pools),
+        "markets": deepcopy(markets),
+        "players": deepcopy(players),
+        "validators": deepcopy(validators or {}),
+        "pending_requests": [],
+        "processed_request_ids": [],
+        "blocks": [],
+        "stats": {
+            "block_count": 0,
+            "processed_request_count": 0,
+            "confirmed_transaction_count": 0,
+            "rejected_transaction_count": 0,
+            "total_fees_lamports": 0,
+        },
+    }
+    refresh_runtime_views(blockchain_state)
+    return blockchain_state
+
+
+def submit_transaction_request(
+    blockchain_state: dict[str, Any],
+    request_tx: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Submit a transaction request into the chain state's pending queue.
+
+    This is the mempool-like entry point used by simulated players and agents before validators
+    select requests for block production.
+    """
+    request_id = request_tx["request_id"]
+    pending_request_ids = {pending_request["request_id"] for pending_request in blockchain_state["pending_requests"]}
+    processed_request_ids = set(blockchain_state["processed_request_ids"])
+    if request_id in pending_request_ids or request_id in processed_request_ids:
+        raise ValueError(f"duplicate request_id: {request_id}")
+
+    request_copy = deepcopy(request_tx)
+    blockchain_state["pending_requests"].append(request_copy)
+    return request_copy
+
+
+def verify_block_parent_link(blockchain_state: dict[str, Any], block: dict[str, Any]) -> bool:
+    """Return True when a candidate block extends the current chain head."""
+    return (
+        block["parent_block_hash"] == blockchain_state["head_block_hash"]
+        and block["slot"] == blockchain_state["next_slot"]
+    )
+
+
+def apply_system_transfer_instruction(
+    accounts: dict[str, dict[str, Any]],
+    instruction: dict[str, Any],
+) -> None:
+    payload = decode_system_transfer_data(instruction["data"])
+    lamports = payload["lamports"]
+    sender_account = get_required_account(accounts, instruction["accounts"][0]["pubkey"])
+    recipient_account = ensure_account_state(
+        accounts, instruction["accounts"][1]["pubkey"], owner=SYSTEM_PROGRAM_ID
+    )
+    if sender_account["lamports"] < lamports:
+        raise ValueError("system transfer sender balance too low")
+    sender_account["lamports"] -= lamports
+    recipient_account["lamports"] += lamports
+    record_account_activity(sender_account, 101)
+    record_account_activity(recipient_account, 102)
+
+
+def apply_pool_swap_instruction(
+    accounts: dict[str, dict[str, Any]],
+    pools: dict[str, dict[str, Any]],
+    players: dict[str, dict[str, Any]],
+    request_tx: dict[str, Any],
+    instruction: dict[str, Any],
+) -> None:
+    venue_id = request_tx["metadata"].get("venue_id")
+    player_id = request_tx["metadata"].get("player_id")
+    if venue_id is None or player_id is None:
+        raise ValueError("pool swap is missing venue_id or player_id metadata")
+
+    pool = pools[venue_id]
+    player = players[player_id]
+    payload = decode_pool_swap_data(instruction["data"])
+    trader_source_account_pubkey = instruction["accounts"][1]["pubkey"]
+    trader_destination_account_pubkey = instruction["accounts"][2]["pubkey"]
+
+    source_symbol = None
+    destination_symbol = None
+    for token_symbol, token_account in player["token_accounts"].items():
+        if token_account == trader_source_account_pubkey:
+            source_symbol = token_symbol
+        if token_account == trader_destination_account_pubkey:
+            destination_symbol = token_symbol
+
+    if source_symbol is None or destination_symbol is None:
+        raise ValueError("could not map pool swap accounts back to player token symbols")
+
+    source_index = pool["token_symbols"].index(source_symbol)
+    destination_index = pool["token_symbols"].index(destination_symbol)
+    source_vault_pubkey = pool["pool_vault_accounts"][source_index]
+    destination_vault_pubkey = pool["pool_vault_accounts"][destination_index]
+
+    trader_source_account = get_required_account(accounts, trader_source_account_pubkey)
+    trader_destination_account = get_required_account(accounts, trader_destination_account_pubkey)
+    source_vault_account = get_required_account(accounts, source_vault_pubkey)
+    destination_vault_account = get_required_account(accounts, destination_vault_pubkey)
+    fee_vault_account = get_required_account(accounts, pool["pool_fee_vault"])
+    pool_state_account = get_required_account(accounts, pool["pool_state_account"])
+
+    source_reserve = source_vault_account["lamports"]
+    destination_reserve = destination_vault_account["lamports"]
+    fee_bps = fee_bps_for_pool(pool)
+
+    if payload["swap_mode"] == SWAP_MODE_EXACT_INPUT:
+        total_input_amount = int(payload["amount"])
+        if trader_source_account["lamports"] < total_input_amount:
+            raise ValueError("pool swap source balance too low")
+        fee_amount = (total_input_amount * fee_bps) // 10_000
+        if fee_amount >= total_input_amount:
+            fee_amount = max(total_input_amount - 1, 0)
+        net_input_amount = total_input_amount - fee_amount
+        output_amount = pool_output_for_exact_input(
+            pool=pool,
+            source_reserve=source_reserve,
+            destination_reserve=destination_reserve,
+            source_index=source_index,
+            destination_index=destination_index,
+            net_input_amount=net_input_amount,
+        )
+        if output_amount < int(payload["other_amount_threshold"]):
+            raise ValueError("pool swap output did not satisfy slippage threshold")
+    else:
+        desired_output_amount = int(payload["amount"])
+        required_input = required_input_for_exact_output(
+            pool=pool,
+            source_reserve=source_reserve,
+            destination_reserve=destination_reserve,
+            source_index=source_index,
+            destination_index=destination_index,
+            desired_output_amount=desired_output_amount,
+            max_total_input_amount=int(payload["other_amount_threshold"]),
+        )
+        if required_input is None:
+            raise ValueError("pool swap exact-output request exceeded max input threshold")
+        total_input_amount, net_input_amount = required_input
+        if trader_source_account["lamports"] < total_input_amount:
+            raise ValueError("pool swap source balance too low")
+        fee_amount = total_input_amount - net_input_amount
+        output_amount = desired_output_amount
+
+    if destination_vault_account["lamports"] < output_amount:
+        raise ValueError("pool destination vault balance too low")
+
+    trader_source_account["lamports"] -= total_input_amount
+    source_vault_account["lamports"] += net_input_amount
+    fee_vault_account["lamports"] += fee_amount
+    destination_vault_account["lamports"] -= output_amount
+    trader_destination_account["lamports"] += output_amount
+    record_account_activity(pool_state_account, 111)
+    pools[venue_id].setdefault("runtime_state", {}).setdefault("swap_count", 0)
+    pools[venue_id]["runtime_state"]["swap_count"] += 1
+
+
+def apply_pool_liquidity_add_instruction(
+    accounts: dict[str, dict[str, Any]],
+    pools: dict[str, dict[str, Any]],
+    request_tx: dict[str, Any],
+    instruction: dict[str, Any],
+) -> None:
+    venue_id = request_tx["metadata"].get("venue_id")
+    if venue_id is None:
+        raise ValueError("pool liquidity add is missing venue_id metadata")
+
+    pool = pools[venue_id]
+    payload = decode_pool_liquidity_add_data(instruction["data"])
+    token_a_amount = payload["max_token_a_amount"]
+    token_b_amount = payload["max_token_b_amount"]
+    min_lp_tokens_out = payload["min_lp_tokens_out"]
+
+    trader_source_account_a = get_required_account(accounts, instruction["accounts"][1]["pubkey"])
+    trader_source_account_b = get_required_account(accounts, instruction["accounts"][2]["pubkey"])
+    pool_state_account = get_required_account(accounts, instruction["accounts"][3]["pubkey"])
+    pool_vault_a = get_required_account(accounts, instruction["accounts"][4]["pubkey"])
+    pool_vault_b = get_required_account(accounts, instruction["accounts"][5]["pubkey"])
+    pool_lp_mint = get_required_account(accounts, instruction["accounts"][6]["pubkey"])
+    trader_lp_receipt_account = ensure_account_state(
+        accounts, instruction["accounts"][7]["pubkey"], owner=TOKEN_PROGRAM_ID
+    )
+
+    if trader_source_account_a["lamports"] < token_a_amount or trader_source_account_b["lamports"] < token_b_amount:
+        raise ValueError("liquidity provider source balance too low")
+
+    reserve_a = max(pool_vault_a["lamports"], 1)
+    reserve_b = max(pool_vault_b["lamports"], 1)
+    lp_supply = max(pool_lp_mint["lamports"], 1)
+    minted_lp_tokens = min(
+        (token_a_amount * lp_supply) // reserve_a,
+        (token_b_amount * lp_supply) // reserve_b,
+    )
+    if minted_lp_tokens < min_lp_tokens_out:
+        raise ValueError("liquidity add did not satisfy minimum LP output")
+
+    trader_source_account_a["lamports"] -= token_a_amount
+    trader_source_account_b["lamports"] -= token_b_amount
+    pool_vault_a["lamports"] += token_a_amount
+    pool_vault_b["lamports"] += token_b_amount
+    pool_lp_mint["lamports"] += minted_lp_tokens
+    trader_lp_receipt_account["lamports"] += minted_lp_tokens
+    record_account_activity(pool_state_account, 112)
+    pools[venue_id].setdefault("runtime_state", {}).setdefault("liquidity_add_count", 0)
+    pools[venue_id]["runtime_state"]["liquidity_add_count"] += 1
+
+
+def apply_market_trade_instruction(
+    accounts: dict[str, dict[str, Any]],
+    markets: dict[str, dict[str, Any]],
+    request_tx: dict[str, Any],
+    instruction: dict[str, Any],
+) -> None:
+    venue_id = request_tx["metadata"].get("venue_id")
+    if venue_id is None:
+        raise ValueError("market trade is missing venue_id metadata")
+
+    market = markets[venue_id]
+    payload = decode_market_swap_data(instruction["data"])
+    base_amount = int(payload["base_amount"])
+    quote_amount = estimate_market_quote_amount(
+        side=str(payload["side"]),
+        order_type=str(payload["order_type"]),
+        base_amount=base_amount,
+        quote_amount_limit=int(payload["quote_amount_limit"]),
+        limit_price=int(payload["limit_price"]),
+    )
+    if quote_amount <= 0:
+        raise ValueError("market trade quote amount must be positive")
+
+    trader_base_account = get_required_account(accounts, instruction["accounts"][1]["pubkey"])
+    trader_quote_account = get_required_account(accounts, instruction["accounts"][2]["pubkey"])
+    open_orders_account = get_required_account(accounts, instruction["accounts"][3]["pubkey"])
+    event_queue_account = get_required_account(accounts, instruction["accounts"][4]["pubkey"])
+    market_state_account = get_required_account(accounts, instruction["accounts"][5]["pubkey"])
+    bids_account = get_required_account(accounts, instruction["accounts"][6]["pubkey"])
+    asks_account = get_required_account(accounts, instruction["accounts"][7]["pubkey"])
+    base_vault_account = get_required_account(accounts, instruction["accounts"][8]["pubkey"])
+    quote_vault_account = get_required_account(accounts, instruction["accounts"][9]["pubkey"])
+
+    if payload["side"] == MARKET_SIDE_BUY:
+        if trader_quote_account["lamports"] < quote_amount:
+            raise ValueError("market buy quote balance too low")
+        if base_vault_account["lamports"] < base_amount:
+            raise ValueError("market buy base vault balance too low")
+        trader_quote_account["lamports"] -= quote_amount
+        quote_vault_account["lamports"] += quote_amount
+        base_vault_account["lamports"] -= base_amount
+        trader_base_account["lamports"] += base_amount
+        record_account_activity(bids_account, 121)
+    else:
+        if trader_base_account["lamports"] < base_amount:
+            raise ValueError("market sell base balance too low")
+        if quote_vault_account["lamports"] < quote_amount:
+            raise ValueError("market sell quote vault balance too low")
+        trader_base_account["lamports"] -= base_amount
+        base_vault_account["lamports"] += base_amount
+        quote_vault_account["lamports"] -= quote_amount
+        trader_quote_account["lamports"] += quote_amount
+        record_account_activity(asks_account, 122)
+
+    record_account_activity(open_orders_account, 123)
+    record_account_activity(event_queue_account, 124)
+    record_account_activity(market_state_account, 125)
+    runtime_state = markets[venue_id].setdefault("runtime_state", {})
+    runtime_state["trade_count"] = runtime_state.get("trade_count", 0) + 1
+    runtime_state["base_volume"] = runtime_state.get("base_volume", 0) + base_amount
+    runtime_state["quote_volume"] = runtime_state.get("quote_volume", 0) + quote_amount
+    runtime_state["last_trade_price"] = (quote_amount * MARKET_PRICE_SCALE) // max(base_amount, 1)
+
+
+def mark_transaction_rejected(
+    transaction_record: dict[str, Any],
+    error_code: str,
+    details: dict[str, Any],
+) -> None:
+    transaction_record["status"] = "rejected"
+    transaction_record["meta"]["err"] = {error_code: details}
+    transaction_record["meta"]["log_messages"].append(f"state transition rejected: {error_code}")
+
+
+def apply_transaction_to_state(
+    blockchain_state: dict[str, Any],
+    request_tx: dict[str, Any],
+    transaction_record: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Apply one materialized transaction to chain state.
+
+    Transaction execution is modeled atomically: fees are charged first, but instruction-side
+    state changes commit only if every instruction succeeds. If execution fails, the fee stays
+    charged and the rest of the state is rolled back.
+    """
+    accounts = blockchain_state["accounts"]
+    validators = blockchain_state["validators"]
+    fee_payer = get_required_account(accounts, request_tx["fee_payer"])
+    fee_lamports = transaction_record["meta"]["fee_lamports"]
+
+    if fee_payer["lamports"] < fee_lamports:
+        transaction_record["meta"]["fee_charged_lamports"] = 0
+        mark_transaction_rejected(
+            transaction_record,
+            "insufficient_fee_balance",
+            {
+                "fee_payer": request_tx["fee_payer"],
+                "fee_lamports": fee_lamports,
+                "available_lamports": fee_payer["lamports"],
+            },
+        )
+        refresh_runtime_views(blockchain_state)
+        return transaction_record
+
+    fee_payer["lamports"] -= fee_lamports
+    transaction_record["meta"]["fee_charged_lamports"] = fee_lamports
+    validator = validators.get(transaction_record["validator_id"])
+    if validator is not None:
+        validator["fees_earned_lamports"] += fee_lamports
+
+    if transaction_record["status"] != "confirmed":
+        transaction_record["meta"]["log_messages"].append(
+            "state application skipped because transaction was already rejected"
+        )
+        refresh_runtime_views(blockchain_state)
+        return transaction_record
+
+    trial_accounts = deepcopy(accounts)
+    trial_pools = deepcopy(blockchain_state["pools"])
+    trial_markets = deepcopy(blockchain_state["markets"])
+
+    try:
+        for instruction in request_tx["instructions"]:
+            if instruction["program_id"] == SYSTEM_PROGRAM_ID:
+                apply_system_transfer_instruction(trial_accounts, instruction)
+            elif instruction["program_id"] == AMM_SIM_PROGRAM_ID:
+                if len(instruction["data"]) == struct.calcsize("<BQQ"):
+                    apply_pool_swap_instruction(
+                        trial_accounts,
+                        trial_pools,
+                        blockchain_state["players"],
+                        request_tx,
+                        instruction,
+                    )
+                elif len(instruction["data"]) == struct.calcsize("<QQQ"):
+                    apply_pool_liquidity_add_instruction(
+                        trial_accounts,
+                        trial_pools,
+                        request_tx,
+                        instruction,
+                    )
+                else:
+                    raise ValueError("unsupported AMM instruction payload shape")
+            elif instruction["program_id"] == MARKET_SIM_PROGRAM_ID:
+                apply_market_trade_instruction(
+                    trial_accounts,
+                    trial_markets,
+                    request_tx,
+                    instruction,
+                )
+            else:
+                raise ValueError(f"unsupported program_id in state application: {instruction['program_id']}")
+    except ValueError as exc:
+        mark_transaction_rejected(
+            transaction_record,
+            "state_transition_failed",
+            {"reason": str(exc)},
+        )
+        refresh_runtime_views(blockchain_state)
+        return transaction_record
+
+    blockchain_state["accounts"] = trial_accounts
+    blockchain_state["pools"] = trial_pools
+    blockchain_state["markets"] = trial_markets
+    refresh_runtime_views(blockchain_state)
+    transaction_record["meta"]["log_messages"].append("state transition applied")
+    return transaction_record
+
+
+def produce_block(
+    blockchain_state: dict[str, Any],
+    leader_id: str,
+    max_transactions: int | None = None,
+) -> dict[str, Any]:
+    """
+    Materialize a block candidate from the current pending request queue.
+
+    This previews validator processing against a copy of the current chain state so transaction
+    statuses reflect sequential execution before the block is actually appended.
+    """
+    if blockchain_state["validators"] and leader_id not in blockchain_state["validators"]:
+        raise ValueError(f"unknown validator: {leader_id}")
+    if not blockchain_state["pending_requests"]:
+        raise ValueError("no pending requests to include in a block")
+
+    if max_transactions is None:
+        selected_requests = list(blockchain_state["pending_requests"])
+    else:
+        selected_requests = list(blockchain_state["pending_requests"][:max_transactions])
+    if not selected_requests:
+        raise ValueError("max_transactions selected zero requests")
+
+    preview_state = deepcopy(blockchain_state)
+    slot = blockchain_state["next_slot"]
+    transactions = []
+    for request_tx in selected_requests:
+        transaction_record = materialize_transaction(request_tx, validator_id=leader_id, slot=slot)
+        apply_transaction_to_state(preview_state, request_tx, transaction_record)
+        transactions.append(transaction_record)
+
+    block = create_block(
+        slot=slot,
+        leader_id=leader_id,
+        parent_block_hash=blockchain_state["head_block_hash"],
+        transactions=transactions,
+    )
+    block["included_request_ids"] = [request_tx["request_id"] for request_tx in selected_requests]
+    return block
+
+
+def append_block(
+    blockchain_state: dict[str, Any],
+    block: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Append a produced block to the persistent chain state and commit its state transitions.
+    """
+    if not verify_block_parent_link(blockchain_state, block):
+        raise ValueError("block does not extend the current chain head")
+
+    pending_requests_by_id = {
+        request_tx["request_id"]: request_tx for request_tx in blockchain_state["pending_requests"]
+    }
+    for transaction_record in block["transactions"]:
+        request_id = transaction_record["request_id"]
+        if request_id not in pending_requests_by_id:
+            raise ValueError(f"block references unknown pending request: {request_id}")
+        apply_transaction_to_state(
+            blockchain_state,
+            pending_requests_by_id[request_id],
+            deepcopy(transaction_record),
+        )
+
+    included_request_ids = [transaction_record["request_id"] for transaction_record in block["transactions"]]
+    included_request_id_set = set(included_request_ids)
+    blockchain_state["pending_requests"] = [
+        request_tx
+        for request_tx in blockchain_state["pending_requests"]
+        if request_tx["request_id"] not in included_request_id_set
+    ]
+    blockchain_state["processed_request_ids"].extend(included_request_ids)
+    blockchain_state["blocks"].append(deepcopy(block))
+    blockchain_state["head_block_hash"] = block["block_hash"]
+    blockchain_state["head_slot"] = block["slot"]
+    blockchain_state["next_slot"] = block["slot"] + 1
+    blockchain_state["current_epoch"] = (max(block["slot"], 1) - 1) // blockchain_state["epoch_schedule"][
+        "slots_per_epoch"
+    ]
+    blockchain_state["stats"]["block_count"] += 1
+    blockchain_state["stats"]["processed_request_count"] += len(block["transactions"])
+    blockchain_state["stats"]["confirmed_transaction_count"] += block["confirmed_transaction_count"]
+    blockchain_state["stats"]["rejected_transaction_count"] += block["rejected_transaction_count"]
+    blockchain_state["stats"]["total_fees_lamports"] += block["total_fees_lamports"]
+    leader = blockchain_state["validators"].get(block["leader_id"])
+    if leader is not None:
+        leader["produced_block_count"] += 1
+        leader["last_produced_slot"] = block["slot"]
+    refresh_runtime_views(blockchain_state)
+    return block
+
+
+def summarize_blockchain_state(blockchain_state: dict[str, Any]) -> dict[str, Any]:
+    """Return a compact JSON-friendly summary of the live chain state."""
+    return {
+        "chain_id": blockchain_state["chain_id"],
+        "genesis_hash": blockchain_state["genesis_hash"],
+        "head_block_hash": blockchain_state["head_block_hash"],
+        "head_slot": blockchain_state["head_slot"],
+        "next_slot": blockchain_state["next_slot"],
+        "current_epoch": blockchain_state["current_epoch"],
+        "slots_per_epoch": blockchain_state["epoch_schedule"]["slots_per_epoch"],
+        "pending_request_count": len(blockchain_state["pending_requests"]),
+        "block_count": len(blockchain_state["blocks"]),
+        "validator_ids": list(blockchain_state["validators"].keys()),
+        "stats": deepcopy(blockchain_state["stats"]),
+    }
 
 
 def sample_pools() -> dict[str, dict[str, Any]]:
@@ -1867,6 +2663,42 @@ def sample_players() -> dict[str, dict[str, Any]]:
     }
 
 
+def sample_validators() -> dict[str, dict[str, Any]]:
+    """Build a small validator set for block production and later stake-based scheduling."""
+    return {
+        "validator_alpha": build_validator_profile(
+            validator_id="validator_alpha",
+            identity_account=make_address("validator_alpha_identity"),
+            vote_account=make_address("validator_alpha_vote"),
+            activated_stake_lamports=800_000 * LAMPORTS_PER_SOL,
+            self_stake_lamports=50_000 * LAMPORTS_PER_SOL,
+            commission_bps=500,
+            delegator_count=120,
+            metadata={"region": "eu-west", "role": "current_demo_leader"},
+        ),
+        "validator_beta": build_validator_profile(
+            validator_id="validator_beta",
+            identity_account=make_address("validator_beta_identity"),
+            vote_account=make_address("validator_beta_vote"),
+            activated_stake_lamports=500_000 * LAMPORTS_PER_SOL,
+            self_stake_lamports=35_000 * LAMPORTS_PER_SOL,
+            commission_bps=700,
+            delegator_count=85,
+            metadata={"region": "us-east"},
+        ),
+        "validator_gamma": build_validator_profile(
+            validator_id="validator_gamma",
+            identity_account=make_address("validator_gamma_identity"),
+            vote_account=make_address("validator_gamma_vote"),
+            activated_stake_lamports=300_000 * LAMPORTS_PER_SOL,
+            self_stake_lamports=20_000 * LAMPORTS_PER_SOL,
+            commission_bps=600,
+            delegator_count=55,
+            metadata={"region": "ap-southeast"},
+        ),
+    }
+
+
 def sample_accounts() -> dict[str, dict[str, Any]]:
     """
     Build a broad sample account set for the simulator.
@@ -1909,6 +2741,36 @@ def sample_accounts() -> dict[str, dict[str, Any]]:
         make_address("index_rebalancer"): build_account_state(
             lamports=14 * LAMPORTS_PER_SOL,
             owner=SYSTEM_PROGRAM_ID,
+        ),
+        # Validator identity accounts are the operator wallets/nodes for each validator.
+        make_address("validator_alpha_identity"): build_account_state(
+            lamports=40 * LAMPORTS_PER_SOL,
+            owner=SYSTEM_PROGRAM_ID,
+        ),
+        make_address("validator_beta_identity"): build_account_state(
+            lamports=35 * LAMPORTS_PER_SOL,
+            owner=SYSTEM_PROGRAM_ID,
+        ),
+        make_address("validator_gamma_identity"): build_account_state(
+            lamports=30 * LAMPORTS_PER_SOL,
+            owner=SYSTEM_PROGRAM_ID,
+        ),
+        # Vote accounts are where stake is delegated in Solana's PoS model and where validator
+        # voting state would later live for rewards and leader-selection logic.
+        make_address("validator_alpha_vote"): build_account_state(
+            lamports=2 * LAMPORTS_PER_SOL,
+            owner=VOTE_PROGRAM_ID,
+            data=[71, 1, 0, 0],
+        ),
+        make_address("validator_beta_vote"): build_account_state(
+            lamports=2 * LAMPORTS_PER_SOL,
+            owner=VOTE_PROGRAM_ID,
+            data=[72, 1, 0, 0],
+        ),
+        make_address("validator_gamma_vote"): build_account_state(
+            lamports=2 * LAMPORTS_PER_SOL,
+            owner=VOTE_PROGRAM_ID,
+            data=[73, 1, 0, 0],
         ),
         # Liquidity provider wallet kept here as a foundation for later LP behavior simulation.
         make_address("liquidity_provider"): build_account_state(
@@ -2197,30 +3059,46 @@ def sample_transaction_requests(
 
 def sample_block_from_requests(
     requests: list[dict[str, Any]],
+    accounts: dict[str, dict[str, Any]],
+    pools: dict[str, dict[str, Any]],
+    markets: dict[str, dict[str, Any]],
+    players: dict[str, dict[str, Any]],
+    validators: dict[str, dict[str, Any]],
     leader_id: str = "validator_alpha",
-    slot: int = 1,
-    parent_block_hash: str = "genesis",
 ) -> dict[str, Any]:
-    executed_transactions = [
-        materialize_transaction(request_tx, validator_id=leader_id, slot=slot)
-        for request_tx in requests
-    ]
-    return create_block(
-        slot=slot,
-        leader_id=leader_id,
-        parent_block_hash=parent_block_hash,
-        transactions=executed_transactions,
+    blockchain_state = build_blockchain_state(
+        accounts=accounts,
+        pools=pools,
+        markets=markets,
+        players=players,
+        validators=validators,
     )
+    for request_tx in requests:
+        submit_transaction_request(blockchain_state, request_tx)
+    block = produce_block(blockchain_state, leader_id=leader_id)
+    append_block(blockchain_state, block)
+    return block
 
 
 def main() -> None:
     pools = sample_pools()
     markets = sample_markets()
     players = sample_players()
+    validators = sample_validators()
     player_intents = sample_player_intents(players, pools, markets)
     accounts = sample_accounts()
     requests = sample_transaction_requests(player_intents, players, pools, markets)
-    block = sample_block_from_requests(requests)
+    blockchain_state = build_blockchain_state(
+        accounts=accounts,
+        pools=pools,
+        markets=markets,
+        players=players,
+        validators=validators,
+    )
+    for request_tx in requests:
+        submit_transaction_request(blockchain_state, request_tx)
+    block = produce_block(blockchain_state, leader_id="validator_alpha")
+    append_block(blockchain_state, block)
 
     print("POOLS")
     print(to_json(pools))
@@ -2231,17 +3109,26 @@ def main() -> None:
     print("PLAYERS")
     print(to_json(players))
     print()
+    print("VALIDATORS")
+    print(to_json(blockchain_state["validators"]))
+    print()
     print("PLAYER INTENTS")
     print(to_json(player_intents))
     print()
-    print("ACCOUNTS")
+    print("INITIAL ACCOUNTS")
     print(to_json(accounts))
     print()
     print("TRANSACTION REQUESTS")
     print(to_json(requests))
     print()
+    print("BLOCKCHAIN STATE SUMMARY")
+    print(to_json(summarize_blockchain_state(blockchain_state)))
+    print()
+    print("CHAIN ACCOUNTS")
+    print(to_json(blockchain_state["accounts"]))
+    print()
     print("FINALIZED BLOCK")
-    print(to_json(block))
+    print(to_json(blockchain_state["blocks"][-1]))
 
 
 if __name__ == "__main__":
