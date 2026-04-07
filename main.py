@@ -2650,8 +2650,9 @@ def apply_pool_liquidity_add_instruction(
     pool_lp_mint["lamports"] += minted_lp_tokens
     trader_lp_receipt_account["lamports"] += minted_lp_tokens
     record_account_activity(pool_state_account, 112)
-    pools[venue_id].setdefault("runtime_state", {}).setdefault("liquidity_add_count", 0)
-    pools[venue_id]["runtime_state"]["liquidity_add_count"] += 1
+    runtime_state = pool.setdefault("runtime_state", {})
+    runtime_state.setdefault("liquidity_add_count", 0)
+    runtime_state["liquidity_add_count"] += 1
 
 
 def apply_market_trade_instruction(
@@ -2711,7 +2712,7 @@ def apply_market_trade_instruction(
     record_account_activity(open_orders_account, 123)
     record_account_activity(event_queue_account, 124)
     record_account_activity(market_state_account, 125)
-    runtime_state = markets[venue_id].setdefault("runtime_state", {})
+    runtime_state = market.setdefault("runtime_state", {})
     runtime_state["trade_count"] = runtime_state.get("trade_count", 0) + 1
     runtime_state["base_volume"] = runtime_state.get("base_volume", 0) + base_amount
     runtime_state["quote_volume"] = runtime_state.get("quote_volume", 0) + quote_amount
