@@ -7,6 +7,7 @@
 # create a way to resolve conflicts between chains
 # create a way to register nodes in the network
 # create a way to reach consensus between nodes
+# create liquidity pools and a way to swap between them
 # create a random transaction request loop to test the blockchain
 # create transaction data using benford's law to simulate real-world transactions
 # flask import is maybe not needed if we are just simulating the blockchain and not creating an API for it, but it could be useful for testing and interacting with the blockchain through HTTP requests. We can decide later if we want to keep it or not.
@@ -64,6 +65,7 @@ VERSIONED_V0_TRANSACTION_FORMAT = "v0"
 # accounts and instruction data.
 # A program_id is the address of the on-chain program that should execute an instruction.
 # It also appears as the owner of accounts whose data that program controls.
+
 SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
 STAKE_PROGRAM_ID = "Stake11111111111111111111111111111111111111"
 VOTE_PROGRAM_ID = "Vote111111111111111111111111111111111111111"
@@ -117,6 +119,9 @@ def shortvec_length(value: int) -> int:
 
     This helper does not serialize the value itself; it only tells us how many bytes the
     encoded length prefix would occupy so we can estimate transaction size.
+    
+    7 bits of the value are encoded per byte, and the high bit is a continuation flag.
+    The helper keeps shifting by 7 bits until the remaining value is zero, counting how many bytes that takes.
     """
     if value < 0:
         raise ValueError("shortvec values must be non-negative")
