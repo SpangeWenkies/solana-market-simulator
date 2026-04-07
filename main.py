@@ -1001,8 +1001,8 @@ def compile_player_intents_to_requests(
 
 def generate_market_maker_intents(
     player: dict[str, Any],
-    pools: dict[str, dict[str, Any]],
-    markets: dict[str, dict[str, Any]],
+    _pools: dict[str, dict[str, Any]],
+    _markets: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """
     Generate sample intents for a market maker.
@@ -1012,8 +1012,6 @@ def generate_market_maker_intents(
     - funding a general liquidity wallet
     - posting a limit-style market trade on the spot venue
     """
-    del pools
-    del markets
     return [
         build_player_intent(
             player_id=player["player_id"],
@@ -1051,8 +1049,8 @@ def generate_market_maker_intents(
 
 def generate_liquidity_provider_intents(
     player: dict[str, Any],
-    pools: dict[str, dict[str, Any]],
-    markets: dict[str, dict[str, Any]],
+    _pools: dict[str, dict[str, Any]],
+    _markets: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """
     Generate sample intents for a liquidity provider.
@@ -1060,8 +1058,6 @@ def generate_liquidity_provider_intents(
     LPs interact with pools rather than central-limit-order-book style markets. Their first
     modeled behavior is adding inventory to a volatile constant-product pool.
     """
-    del pools
-    del markets
     return [
         build_player_intent(
             player_id=player["player_id"],
@@ -1084,8 +1080,8 @@ def generate_liquidity_provider_intents(
 
 def generate_retail_user_intents(
     player: dict[str, Any],
-    pools: dict[str, dict[str, Any]],
-    markets: dict[str, dict[str, Any]],
+    _pools: dict[str, dict[str, Any]],
+    _markets: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """
     Generate sample intents for a retail user.
@@ -1093,8 +1089,6 @@ def generate_retail_user_intents(
     Retail flow is usually mixed: ordinary payments plus venue interaction. We model both a
     merchant payment and a spot-market market order from the same player profile.
     """
-    del pools
-    del markets
     return [
         build_player_intent(
             player_id=player["player_id"],
@@ -1133,8 +1127,8 @@ def generate_retail_user_intents(
 
 def generate_arbitrageur_intents(
     player: dict[str, Any],
-    pools: dict[str, dict[str, Any]],
-    markets: dict[str, dict[str, Any]],
+    _pools: dict[str, dict[str, Any]],
+    _markets: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """
     Generate sample intents for an arbitrageur.
@@ -1142,8 +1136,6 @@ def generate_arbitrageur_intents(
     Arbitrageurs care about fast pool-to-price dislocations, so they emit high-priority swap
     flow against volatile pools.
     """
-    del pools
-    del markets
     return [
         build_player_intent(
             player_id=player["player_id"],
@@ -1168,8 +1160,8 @@ def generate_arbitrageur_intents(
 
 def generate_router_intents(
     player: dict[str, Any],
-    pools: dict[str, dict[str, Any]],
-    markets: dict[str, dict[str, Any]],
+    _pools: dict[str, dict[str, Any]],
+    _markets: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """
     Generate sample intents for a router.
@@ -1177,8 +1169,6 @@ def generate_router_intents(
     Routers optimize path selection and execution quality, so this sample sends a v0 stable-pool
     swap using a lookup table and exact-output semantics.
     """
-    del pools
-    del markets
     return [
         build_player_intent(
             player_id=player["player_id"],
@@ -1204,8 +1194,8 @@ def generate_router_intents(
 
 def generate_rebalancer_intents(
     player: dict[str, Any],
-    pools: dict[str, dict[str, Any]],
-    markets: dict[str, dict[str, Any]],
+    _pools: dict[str, dict[str, Any]],
+    _markets: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """
     Generate sample intents for a portfolio rebalancer.
@@ -1213,8 +1203,6 @@ def generate_rebalancer_intents(
     Rebalancers trade toward target allocations rather than short-term prices, so this sample
     interacts with the weighted multi-token pool.
     """
-    del pools
-    del markets
     return [
         build_player_intent(
             player_id=player["player_id"],
