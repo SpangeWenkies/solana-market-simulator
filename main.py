@@ -11,6 +11,7 @@ underlying byte lengths and not the string lengths of any hex-encoded values.
 
 import hashlib
 import json
+import math
 import struct
 import time
 from copy import deepcopy
@@ -44,6 +45,7 @@ TRANSACTION_ACCOUNT_BASE_SIZE = 64
 MAX_INSTRUCTION_DATA_LEN = 10_240
 RENT_EXEMPT_RENT_EPOCH = (1 << 64) - 1
 DEFAULT_SLOTS_PER_EPOCH = 32
+STAKE_WARMUP_COOLDOWN_RATE = 0.25
 MARKET_PRICE_SCALE = 1_000_000
 CONSTANT_PRODUCT_SWAP_FEE_BPS = 30
 STABLE_SWAP_FEE_BPS = 4
@@ -88,6 +90,11 @@ PLAYER_TYPE_RETAIL_USER = "retail_user"
 PLAYER_TYPE_ARBITRAGEUR = "arbitrageur"
 PLAYER_TYPE_ROUTER = "router"
 PLAYER_TYPE_REBALANCER = "rebalancer"
+
+REGISTRY_STATUS_ACTIVE = "active"
+REGISTRY_STATUS_INACTIVE = "inactive"
+REGISTRY_STATUS_EXITING = "exiting"
+REGISTRY_STATUS_DEREGISTERED = "deregistered"
 
 INTENT_TYPE_SYSTEM_TRANSFER = "system_transfer"
 INTENT_TYPE_POOL_SWAP = "pool_swap"
@@ -741,13 +748,17 @@ def build_validator_profile(
         "delegator_count": delegator_count,
         "fees_earned_lamports": 0,
         "staking_rewards_earned_lamports": 0,
+        "withdrawable_stake_lamports": 0,
         "produced_block_count": 0,
         "last_produced_slot": None,
         "last_vote_slot": None,
         "root_slot": None,
         "epoch_credits": [],
         "is_delinquent": False,
-        "status": "active",
+        "status": REGISTRY_STATUS_ACTIVE,
+        "deactivation_requested_epoch": None,
+        "effective_exit_epoch": None,
+        "deregistered_at_slot": None,
         "metadata": metadata or {},
     }
 
@@ -774,6 +785,7 @@ def build_player_profile(
         "authority_account": authority_account,
         "token_accounts": dict(token_accounts or {}),
         "default_message_format": default_message_format,
+        "status": REGISTRY_STATUS_ACTIVE,
         "metadata": metadata or {},
     }
 
@@ -2021,6 +2033,7 @@ def build_blockchain_state(
         "markets": deepcopy(markets),
         "players": deepcopy(players),
         "validators": deepcopy(validators or {}),
+        "leader_schedules": {},
         "pending_requests": [],
         "processed_request_ids": [],
         "blocks": [],
@@ -2034,6 +2047,421 @@ def build_blockchain_state(
     }
     refresh_runtime_views(blockchain_state)
     return blockchain_state
+
+
+def register_validator(
+    blockchain_state: dict[str, Any],
+    validator_profile: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Register a validator into the live chain state.
+
+    This is the runtime registration path for growing the validator set after the chain has been
+    initialized. The simulator keeps this as a direct state mutation for now rather than modeling
+    validator registration as an on-chain transaction.
+    """
+    validator_id = validator_profile["validator_id"]
+    if validator_id in blockchain_state["validators"]:
+        raise ValueError(f"validator already registered: {validator_id}")
+
+    for existing_validator in blockchain_state["validators"].values():
+        if existing_validator["identity_account"] == validator_profile["identity_account"]:
+            raise ValueError("validator identity account is already registered")
+        if existing_validator["vote_account"] == validator_profile["vote_account"]:
+            raise ValueError("validator vote account is already registered")
+
+    identity_account = ensure_account_state(
+        blockchain_state["accounts"],
+        validator_profile["identity_account"],
+        owner=SYSTEM_PROGRAM_ID,
+    )
+    vote_account = ensure_account_state(
+        blockchain_state["accounts"],
+        validator_profile["vote_account"],
+        owner=VOTE_PROGRAM_ID,
+    )
+    if identity_account["owner"] != SYSTEM_PROGRAM_ID:
+        raise ValueError("validator identity account must be a system account")
+    if vote_account["owner"] != VOTE_PROGRAM_ID:
+        raise ValueError("validator vote account must be a vote account")
+
+    validator_copy = deepcopy(validator_profile)
+    validator_copy["registered_at_slot"] = blockchain_state["head_slot"]
+    blockchain_state["validators"][validator_id] = validator_copy
+    blockchain_state["leader_schedules"].clear()
+    return validator_copy
+
+
+def register_player(
+    blockchain_state: dict[str, Any],
+    player_profile: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Register a player into the live chain state.
+
+    Players are simulation-side actors rather than consensus participants, but runtime
+    registration is still useful because it lets the market population change over time instead
+    of staying frozen in the initial sample set.
+    """
+    player_id = player_profile["player_id"]
+    if player_id in blockchain_state["players"]:
+        raise ValueError(f"player already registered: {player_id}")
+
+    for existing_player in blockchain_state["players"].values():
+        if existing_player["authority_account"] == player_profile["authority_account"]:
+            raise ValueError("player authority account is already registered")
+        existing_token_accounts = set(existing_player["token_accounts"].values())
+        new_token_accounts = set(player_profile["token_accounts"].values())
+        if existing_token_accounts & new_token_accounts:
+            raise ValueError("player token account is already registered")
+
+    authority_account = ensure_account_state(
+        blockchain_state["accounts"],
+        player_profile["authority_account"],
+        owner=SYSTEM_PROGRAM_ID,
+    )
+    if authority_account["owner"] != SYSTEM_PROGRAM_ID:
+        raise ValueError("player authority account must be a system account")
+
+    for token_account_pubkey in player_profile["token_accounts"].values():
+        token_account = ensure_account_state(
+            blockchain_state["accounts"],
+            token_account_pubkey,
+            owner=TOKEN_PROGRAM_ID,
+        )
+        if token_account["owner"] != TOKEN_PROGRAM_ID:
+            raise ValueError("player token accounts must be token-program accounts")
+
+    player_copy = deepcopy(player_profile)
+    player_copy["registered_at_slot"] = blockchain_state["head_slot"]
+    player_copy.setdefault("submitted_request_count", 0)
+    player_copy.setdefault("last_active_slot", None)
+    blockchain_state["players"][player_id] = player_copy
+    return player_copy
+
+
+def set_player_status(
+    blockchain_state: dict[str, Any],
+    player_id: str,
+    status: str,
+) -> dict[str, Any]:
+    """
+    Update a registered player's lifecycle status.
+
+    This is a non-destructive control switch:
+    - `active`: the player may submit new requests
+    - `inactive`: the player stays in the registry/history but is paused
+    - `deregistered`: the player has left the active simulation population
+
+    Example reasons:
+    - a retail user becomes `inactive` overnight and trades again tomorrow
+    - an arbitrage bot becomes `inactive` during maintenance
+    - a bankrupt market maker or a merchant leaving the platform becomes `deregistered`
+
+    That is different from deleting a player object entirely. Keeping the registry entry is
+    usually better for analytics, history, and debugging.
+    """
+    if status not in {
+        REGISTRY_STATUS_ACTIVE,
+        REGISTRY_STATUS_INACTIVE,
+        REGISTRY_STATUS_DEREGISTERED,
+    }:
+        raise ValueError("invalid player status")
+
+    player = blockchain_state["players"].get(player_id)
+    if player is None:
+        raise ValueError(f"unknown player: {player_id}")
+
+    if status == REGISTRY_STATUS_DEREGISTERED:
+        pending_request_ids = [
+            request_tx["request_id"]
+            for request_tx in blockchain_state["pending_requests"]
+            if request_tx["agent_id"] == player_id
+        ]
+        if pending_request_ids:
+            raise ValueError("cannot deregister player while they still have pending requests")
+
+    player["status"] = status
+    player["status_updated_at_slot"] = blockchain_state["head_slot"]
+    if status == REGISTRY_STATUS_DEREGISTERED:
+        player["deregistered_at_slot"] = blockchain_state["head_slot"]
+    return player
+
+
+def deregister_player(
+    blockchain_state: dict[str, Any],
+    player_id: str,
+) -> dict[str, Any]:
+    """
+    Deregister a player from the active simulation population.
+
+    Deregistration is implemented as a status transition rather than hard deletion so historical
+    requests, balances, and analytics still have a stable player reference.
+
+    Typical examples are a player going bankrupt, a strategy being retired permanently, or a
+    merchant leaving the simulated ecosystem.
+    """
+    return set_player_status(
+        blockchain_state,
+        player_id,
+        REGISTRY_STATUS_DEREGISTERED,
+    )
+
+
+def estimate_validator_exit_epochs(
+    blockchain_state: dict[str, Any],
+    validator_id: str,
+) -> int:
+    """
+    Estimate how many epochs validator exit should take in this simulator.
+
+    Solana does not use a fixed "validator exits in N epochs" rule. The official staking docs
+    describe warmup/cooldown as rate-limited at the network level, with at most 25% of total
+    active stake activating or deactivating per epoch. That means deactivation can take several
+    epochs depending on how much stake is moving.
+
+    This simulator approximates that by using:
+    `ceil(validator_active_stake / (total_active_stake * 25%))`, with a minimum of 1 epoch.
+    It is a simplification, but it keeps the core Solana property that larger stake exits take
+    longer and that exit delay is not a single fixed constant.
+    """
+    validator = blockchain_state["validators"].get(validator_id)
+    if validator is None:
+        raise ValueError(f"unknown validator: {validator_id}")
+
+    total_active_stake = sum(
+        existing_validator["activated_stake_lamports"]
+        for existing_validator in blockchain_state["validators"].values()
+        if existing_validator["status"] in {REGISTRY_STATUS_ACTIVE, REGISTRY_STATUS_EXITING}
+    )
+    if total_active_stake <= 0 or validator["activated_stake_lamports"] <= 0:
+        return 1
+
+    epoch_deactivation_capacity = max(
+        int(total_active_stake * STAKE_WARMUP_COOLDOWN_RATE),
+        1,
+    )
+    return max(
+        1,
+        math.ceil(validator["activated_stake_lamports"] / epoch_deactivation_capacity),
+    )
+
+
+def set_validator_status(
+    blockchain_state: dict[str, Any],
+    validator_id: str,
+    status: str,
+) -> dict[str, Any]:
+    """
+    Update a registered validator's lifecycle status.
+
+    Validators use the same status pattern as players, but changing validator status also clears
+    cached leader schedules because the eligible producer set may have changed.
+
+    Example reasons:
+    - a validator becomes `inactive` for maintenance or an operator outage
+    - a validator enters `exiting` after requesting stake deactivation
+    - a validator becomes `deregistered` after the simulated cooldown finishes
+    """
+    if status not in {
+        REGISTRY_STATUS_ACTIVE,
+        REGISTRY_STATUS_INACTIVE,
+        REGISTRY_STATUS_EXITING,
+        REGISTRY_STATUS_DEREGISTERED,
+    }:
+        raise ValueError("invalid validator status")
+
+    validator = blockchain_state["validators"].get(validator_id)
+    if validator is None:
+        raise ValueError(f"unknown validator: {validator_id}")
+
+    if status == REGISTRY_STATUS_DEREGISTERED and validator["deactivating_stake_lamports"] > 0:
+        raise ValueError("validator cannot fully deregister while stake is still deactivating")
+
+    validator["status"] = status
+    validator["status_updated_at_slot"] = blockchain_state["head_slot"]
+    if status == REGISTRY_STATUS_DEREGISTERED:
+        validator["deregistered_at_slot"] = blockchain_state["head_slot"]
+    blockchain_state["leader_schedules"].clear()
+    return validator
+
+
+def deregister_validator(
+    blockchain_state: dict[str, Any],
+    validator_id: str,
+) -> dict[str, Any]:
+    """
+    Begin validator deregistration using a Solana-style delayed exit approximation.
+
+    Solana stake deactivation is not an instant one-epoch action. The docs describe deactivation
+    as epoch-boundary based and globally rate-limited, with at most 25% of total active stake
+    activating or deactivating in one epoch. This simulator therefore puts the validator into an
+    `exiting` state first and estimates an `effective_exit_epoch` from the current active stake.
+
+    Typical examples are a validator operator permanently leaving the network, shutting down the
+    business, or intentionally removing delegated stake from future leader rotation.
+    """
+    validator = blockchain_state["validators"].get(validator_id)
+    if validator is None:
+        raise ValueError(f"unknown validator: {validator_id}")
+    if validator["status"] == REGISTRY_STATUS_DEREGISTERED:
+        return validator
+
+    exit_epochs = estimate_validator_exit_epochs(blockchain_state, validator_id)
+    validator["deactivation_requested_epoch"] = blockchain_state["current_epoch"]
+    validator["effective_exit_epoch"] = blockchain_state["current_epoch"] + exit_epochs
+    validator["deactivating_stake_lamports"] = validator["activated_stake_lamports"]
+    validator["status_updated_at_slot"] = blockchain_state["head_slot"]
+    blockchain_state["leader_schedules"].clear()
+    return set_validator_status(
+        blockchain_state,
+        validator_id,
+        REGISTRY_STATUS_EXITING,
+    )
+
+
+def validator_is_schedulable_for_epoch(
+    validator: dict[str, Any],
+    epoch: int,
+) -> bool:
+    """Return True when a validator should still count for leader selection in an epoch."""
+    if validator["is_delinquent"] or validator["activated_stake_lamports"] <= 0:
+        return False
+    if validator["status"] == REGISTRY_STATUS_ACTIVE:
+        return True
+    if validator["status"] == REGISTRY_STATUS_EXITING:
+        effective_exit_epoch = validator.get("effective_exit_epoch")
+        return effective_exit_epoch is None or epoch < effective_exit_epoch
+    return False
+
+
+def active_validators(
+    blockchain_state: dict[str, Any],
+    epoch: int | None = None,
+) -> list[dict[str, Any]]:
+    """Return validators eligible for leader selection in deterministic order."""
+    if epoch is None:
+        epoch = blockchain_state["current_epoch"]
+    return sorted(
+        [
+            validator
+            for validator in blockchain_state["validators"].values()
+            if validator_is_schedulable_for_epoch(validator, epoch)
+        ],
+        key=lambda validator: validator["validator_id"],
+    )
+
+
+def pick_validator_by_stake(
+    validators: list[dict[str, Any]],
+    selection_value: int,
+) -> str:
+    """Pick one validator from a stake-weighted list using a deterministic integer."""
+    total_active_stake = sum(validator["activated_stake_lamports"] for validator in validators)
+    if total_active_stake <= 0:
+        raise ValueError("leader selection requires positive active stake")
+
+    cursor = selection_value % total_active_stake
+    running_total = 0
+    for validator in validators:
+        running_total += validator["activated_stake_lamports"]
+        if cursor < running_total:
+            return validator["validator_id"]
+
+    return validators[-1]["validator_id"]
+
+
+def build_leader_schedule_for_epoch(
+    blockchain_state: dict[str, Any],
+    epoch: int,
+) -> dict[str, Any]:
+    """
+    Build a simplified deterministic stake-weighted leader schedule for one epoch.
+
+    This is intentionally lighter than Solana's real schedule generation, but it keeps the core
+    property we need next: validators with more activated stake should be scheduled more often.
+    """
+    cached_schedule = blockchain_state["leader_schedules"].get(epoch)
+    if cached_schedule is not None:
+        return deepcopy(cached_schedule)
+
+    eligible_validators = active_validators(blockchain_state, epoch=epoch)
+    if not eligible_validators:
+        raise ValueError("cannot build leader schedule without active validators")
+
+    slots_per_epoch = blockchain_state["epoch_schedule"]["slots_per_epoch"]
+    first_slot = epoch * slots_per_epoch + 1
+    leaders_by_slot = {}
+    validator_weights = {
+        validator["validator_id"]: validator["activated_stake_lamports"]
+        for validator in eligible_validators
+    }
+
+    for relative_slot in range(slots_per_epoch):
+        slot = first_slot + relative_slot
+        selection_value = int(
+            stable_hash(
+                {
+                    "chain_id": blockchain_state["chain_id"],
+                    "epoch": epoch,
+                    "slot": slot,
+                    "validator_weights": validator_weights,
+                }
+            ),
+            16,
+        )
+        leaders_by_slot[slot] = pick_validator_by_stake(eligible_validators, selection_value)
+
+    schedule = {
+        "epoch": epoch,
+        "first_slot": first_slot,
+        "last_slot": first_slot + slots_per_epoch - 1,
+        "slots_per_epoch": slots_per_epoch,
+        "validator_weights": validator_weights,
+        "leaders_by_slot": leaders_by_slot,
+    }
+    blockchain_state["leader_schedules"][epoch] = deepcopy(schedule)
+    return schedule
+
+
+def select_leader_for_slot(
+    blockchain_state: dict[str, Any],
+    slot: int,
+) -> str:
+    """Select the scheduled leader for a slot from the current epoch schedule."""
+    if slot <= 0:
+        raise ValueError("slot must be positive")
+
+    epoch = (slot - 1) // blockchain_state["epoch_schedule"]["slots_per_epoch"]
+    schedule = build_leader_schedule_for_epoch(blockchain_state, epoch)
+    return schedule["leaders_by_slot"][slot]
+
+
+def finalize_validator_epoch_transitions(blockchain_state: dict[str, Any]) -> None:
+    """
+    Finalize validator exits whose cooldown has completed.
+
+    Exiting validators remain in the registry for history, but once the current epoch reaches
+    their `effective_exit_epoch` they stop counting as active stake and move to `deregistered`.
+    """
+    for validator in blockchain_state["validators"].values():
+        if validator["status"] != REGISTRY_STATUS_EXITING:
+            continue
+        effective_exit_epoch = validator.get("effective_exit_epoch")
+        if effective_exit_epoch is None or blockchain_state["current_epoch"] < effective_exit_epoch:
+            continue
+
+        validator["withdrawable_stake_lamports"] += validator["deactivating_stake_lamports"]
+        validator["activated_stake_lamports"] = 0
+        validator["delegated_stake_lamports"] = 0
+        validator["self_stake_lamports"] = 0
+        validator["stake_lamports"] = 0
+        validator["deactivating_stake_lamports"] = 0
+        validator["deregistered_at_slot"] = blockchain_state["head_slot"]
+        validator["status"] = REGISTRY_STATUS_DEREGISTERED
+        validator["status_updated_at_slot"] = blockchain_state["head_slot"]
+
+    blockchain_state["leader_schedules"].clear()
 
 
 def submit_transaction_request(
@@ -2052,8 +2480,18 @@ def submit_transaction_request(
     if request_id in pending_request_ids or request_id in processed_request_ids:
         raise ValueError(f"duplicate request_id: {request_id}")
 
+    if blockchain_state["players"]:
+        player = blockchain_state["players"].get(request_tx["agent_id"])
+        if player is None:
+            raise ValueError(f"unregistered player submitted request: {request_tx['agent_id']}")
+        if player["status"] != REGISTRY_STATUS_ACTIVE:
+            raise ValueError(f"non-active player submitted request: {request_tx['agent_id']}")
+
     request_copy = deepcopy(request_tx)
     blockchain_state["pending_requests"].append(request_copy)
+    if request_copy["agent_id"] in blockchain_state["players"]:
+        player = blockchain_state["players"][request_copy["agent_id"]]
+        player["submitted_request_count"] += 1
     return request_copy
 
 
@@ -2338,6 +2776,9 @@ def apply_transaction_to_state(
     validator = validators.get(transaction_record["validator_id"])
     if validator is not None:
         validator["fees_earned_lamports"] += fee_lamports
+    player = blockchain_state["players"].get(request_tx["agent_id"])
+    if player is not None:
+        player["last_active_slot"] = transaction_record["slot"]
 
     if transaction_record["status"] != "confirmed":
         transaction_record["meta"]["log_messages"].append(
@@ -2400,7 +2841,7 @@ def apply_transaction_to_state(
 
 def produce_block(
     blockchain_state: dict[str, Any],
-    leader_id: str,
+    leader_id: str | None = None,
     max_transactions: int | None = None,
 ) -> dict[str, Any]:
     """
@@ -2409,10 +2850,25 @@ def produce_block(
     This previews validator processing against a copy of the current chain state so transaction
     statuses reflect sequential execution before the block is actually appended.
     """
-    if blockchain_state["validators"] and leader_id not in blockchain_state["validators"]:
-        raise ValueError(f"unknown validator: {leader_id}")
     if not blockchain_state["pending_requests"]:
         raise ValueError("no pending requests to include in a block")
+
+    slot = blockchain_state["next_slot"]
+    scheduled_leader_id = None
+    if blockchain_state["validators"]:
+        scheduled_leader_id = select_leader_for_slot(blockchain_state, slot)
+        if leader_id is None:
+            leader_id = scheduled_leader_id
+
+    if leader_id is None:
+        raise ValueError("leader_id is required when no validators are registered")
+    if blockchain_state["validators"] and leader_id not in blockchain_state["validators"]:
+        raise ValueError(f"unknown validator: {leader_id}")
+    if blockchain_state["validators"]:
+        leader = blockchain_state["validators"][leader_id]
+        leader_epoch = (slot - 1) // blockchain_state["epoch_schedule"]["slots_per_epoch"]
+        if not validator_is_schedulable_for_epoch(leader, leader_epoch):
+            raise ValueError(f"validator is not eligible to produce block in slot {slot}: {leader_id}")
 
     if max_transactions is None:
         selected_requests = list(blockchain_state["pending_requests"])
@@ -2422,7 +2878,6 @@ def produce_block(
         raise ValueError("max_transactions selected zero requests")
 
     preview_state = deepcopy(blockchain_state)
-    slot = blockchain_state["next_slot"]
     transactions = []
     for request_tx in selected_requests:
         transaction_record = materialize_transaction(request_tx, validator_id=leader_id, slot=slot)
@@ -2436,6 +2891,8 @@ def produce_block(
         transactions=transactions,
     )
     block["included_request_ids"] = [request_tx["request_id"] for request_tx in selected_requests]
+    block["scheduled_leader_id"] = scheduled_leader_id or leader_id
+    block["leader_schedule_match"] = leader_id == (scheduled_leader_id or leader_id)
     return block
 
 
@@ -2477,6 +2934,7 @@ def append_block(
     blockchain_state["current_epoch"] = (max(block["slot"], 1) - 1) // blockchain_state["epoch_schedule"][
         "slots_per_epoch"
     ]
+    finalize_validator_epoch_transitions(blockchain_state)
     blockchain_state["stats"]["block_count"] += 1
     blockchain_state["stats"]["processed_request_count"] += len(block["transactions"])
     blockchain_state["stats"]["confirmed_transaction_count"] += block["confirmed_transaction_count"]
@@ -2492,6 +2950,15 @@ def append_block(
 
 def summarize_blockchain_state(blockchain_state: dict[str, Any]) -> dict[str, Any]:
     """Return a compact JSON-friendly summary of the live chain state."""
+    next_scheduled_leader = None
+    if blockchain_state["validators"]:
+        try:
+            next_scheduled_leader = select_leader_for_slot(
+                blockchain_state,
+                blockchain_state["next_slot"],
+            )
+        except ValueError:
+            next_scheduled_leader = None
     return {
         "chain_id": blockchain_state["chain_id"],
         "genesis_hash": blockchain_state["genesis_hash"],
@@ -2502,7 +2969,19 @@ def summarize_blockchain_state(blockchain_state: dict[str, Any]) -> dict[str, An
         "slots_per_epoch": blockchain_state["epoch_schedule"]["slots_per_epoch"],
         "pending_request_count": len(blockchain_state["pending_requests"]),
         "block_count": len(blockchain_state["blocks"]),
+        "active_player_count": sum(
+            player["status"] == REGISTRY_STATUS_ACTIVE
+            for player in blockchain_state["players"].values()
+        ),
+        "registered_player_count": len(blockchain_state["players"]),
+        "active_validator_count": sum(
+            validator_is_schedulable_for_epoch(validator, blockchain_state["current_epoch"])
+            for validator in blockchain_state["validators"].values()
+        ),
+        "registered_validator_count": len(blockchain_state["validators"]),
+        "player_ids": list(blockchain_state["players"].keys()),
         "validator_ids": list(blockchain_state["validators"].keys()),
+        "next_scheduled_leader": next_scheduled_leader,
         "stats": deepcopy(blockchain_state["stats"]),
     }
 
@@ -3064,15 +3543,18 @@ def sample_block_from_requests(
     markets: dict[str, dict[str, Any]],
     players: dict[str, dict[str, Any]],
     validators: dict[str, dict[str, Any]],
-    leader_id: str = "validator_alpha",
+    leader_id: str | None = None,
 ) -> dict[str, Any]:
     blockchain_state = build_blockchain_state(
         accounts=accounts,
         pools=pools,
         markets=markets,
-        players=players,
-        validators=validators,
+        players={},
     )
+    for player in players.values():
+        register_player(blockchain_state, player)
+    for validator in validators.values():
+        register_validator(blockchain_state, validator)
     for request_tx in requests:
         submit_transaction_request(blockchain_state, request_tx)
     block = produce_block(blockchain_state, leader_id=leader_id)
@@ -3092,12 +3574,15 @@ def main() -> None:
         accounts=accounts,
         pools=pools,
         markets=markets,
-        players=players,
-        validators=validators,
+        players={},
     )
+    for player in players.values():
+        register_player(blockchain_state, player)
+    for validator in validators.values():
+        register_validator(blockchain_state, validator)
     for request_tx in requests:
         submit_transaction_request(blockchain_state, request_tx)
-    block = produce_block(blockchain_state, leader_id="validator_alpha")
+    block = produce_block(blockchain_state)
     append_block(blockchain_state, block)
 
     print("POOLS")

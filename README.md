@@ -27,3 +27,4 @@ Aims/todos:
 - create statistics such as total security budget, total security budget spent, average security budget per transaction, etc. to analyze the security of the blockchain and see if it is being used effectively to protect the network from attacks and malicious actors.
 - create a ui dashboard for everything.
 - optionally create players using smart contracts that can be executed on the blockchain to automate certain processes and create new functionalities. This can include things like decentralized finance (DeFi) applications, non-fungible tokens (NFTs), and other types of decentralized applications (dApps).
+- think of when a player or validator would register and when he would become inactive or deregister
