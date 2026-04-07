@@ -33,6 +33,13 @@ BLOCKHASH_BYTES = 32
 HASH_BYTES = 32
 SIGNATURE_BYTES = 64
 
+TARGET_SLOT_DURATION_MS = 400
+REFERENCE_MAINNET_SLOTS_PER_EPOCH = 8_192
+DEFAULT_BLOCK_COMPUTE_UNIT_LIMIT = 60_000_000
+DEFAULT_BLOCK_PACKET_BYTES_LIMIT = PACKET_DATA_SIZE * 512
+DEFAULT_BLOCK_ACCOUNT_LOCK_LIMIT = 4_096
+DEFAULT_BLOCK_WRITABLE_ACCOUNT_LOCK_LIMIT = 1_024
+
 DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT = 200_000
 MAX_BUILTIN_ALLOCATION_COMPUTE_UNIT_LIMIT = 3_000
 MAX_COMPUTE_UNIT_LIMIT = 1_400_000
@@ -1235,6 +1242,20 @@ PLAYER_INTENT_GENERATORS = {
     PLAYER_TYPE_REBALANCER: generate_rebalancer_intents,
 }
 
+# The current intent generators are still fixed templates rather than fully state-driven
+# strategies. This schedule spreads those templates across slots so a multi-slot simulation can
+# run without every player submitting every possible action on every block.
+INTENT_SLOT_SCHEDULE_RULES = {
+    "fund_liquidity_pool": {"epoch_start_only": True},
+    "post_market_maker_offer": {"every_slots": 2, "slot_offset": 0},
+    "provide_volatile_pool_liquidity": {"epoch_start_only": True},
+    "merchant_payment": {"every_slots": 4, "slot_offset": 0},
+    "spot_market_buy": {"every_slots": 3, "slot_offset": 1},
+    "arbitrage_pool_swap": {"every_slots": 4, "slot_offset": 1},
+    "stable_pool_swap": {"every_slots": 4, "slot_offset": 2},
+    "weighted_pool_rebalance": {"every_slots": 8, "slot_offset": 4},
+}
+
 
 def generate_player_intents(
     players: dict[str, dict[str, Any]],
@@ -1255,6 +1276,89 @@ def generate_player_intents(
             continue
         intents.extend(generator(player, pools, markets))
     return intents
+
+
+def intent_is_scheduled_for_slot(
+    intent: dict[str, Any],
+    slot: int,
+    slots_per_epoch: int,
+) -> bool:
+    """
+    Return True when a sample intent should emit during a specific slot.
+
+    This is a temporary bridge between the current fixed sample-intent layer and the later
+    state-driven behavior layer. It lets the simulator progress over many slots and epochs
+    without every player repeating every action every block.
+    """
+    if slot <= 0:
+        raise ValueError("slot must be positive")
+
+    rule = INTENT_SLOT_SCHEDULE_RULES.get(intent["metadata"].get("intent_label"))
+    if rule is None:
+        return True
+
+    slot_index = slot - 1
+    if rule.get("epoch_start_only"):
+        return slot_index % slots_per_epoch == 0
+
+    every_slots = int(rule.get("every_slots", 1))
+    slot_offset = int(rule.get("slot_offset", 0))
+    if every_slots <= 0:
+        raise ValueError("intent schedule every_slots must be positive")
+    if slot_offset < 0 or slot_offset >= every_slots:
+        raise ValueError("intent schedule slot_offset must be within the cadence interval")
+    return slot_index % every_slots == slot_offset
+
+
+def generate_slot_transaction_requests(
+    blockchain_state: dict[str, Any],
+    slot: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Generate fresh transaction requests for the chain's next slot.
+
+    The simulator currently uses deterministic sample-intent generators, so this is not the
+    later random or state-reactive flow yet. It simply evaluates active registered players,
+    filters their intents through the slot schedule above, and compiles the surviving intents
+    into concrete transaction requests.
+    """
+    target_slot = blockchain_state["next_slot"] if slot is None else slot
+    if target_slot != blockchain_state["next_slot"]:
+        raise ValueError("slot request generation must target the chain's next slot")
+
+    active_players = {
+        player_id: player
+        for player_id, player in blockchain_state["players"].items()
+        if player["status"] == REGISTRY_STATUS_ACTIVE
+    }
+    if not active_players:
+        return []
+
+    slots_per_epoch = blockchain_state["epoch_schedule"]["slots_per_epoch"]
+    target_epoch = (target_slot - 1) // slots_per_epoch
+    intents = generate_player_intents(
+        active_players,
+        blockchain_state["pools"],
+        blockchain_state["markets"],
+    )
+    scheduled_intents = []
+    for intent in intents:
+        if not intent_is_scheduled_for_slot(intent, target_slot, slots_per_epoch):
+            continue
+        intent_copy = deepcopy(intent)
+        intent_copy["metadata"] = {
+            **intent_copy["metadata"],
+            "scheduled_slot": target_slot,
+            "scheduled_epoch": target_epoch,
+        }
+        scheduled_intents.append(intent_copy)
+
+    return compile_player_intents_to_requests(
+        scheduled_intents,
+        blockchain_state["players"],
+        blockchain_state["pools"],
+        blockchain_state["markets"],
+    )
 
 
 def default_compute_unit_limit(instructions: list[dict[str, Any]]) -> int:
@@ -1319,6 +1423,77 @@ def estimate_fee_lamports(
         requested_compute_unit_limit * compute_unit_price_micro_lamports
     ) // 1_000_000
     return base_fee + priority_fee
+
+
+def estimate_request_serialized_size_bytes(request_tx: dict[str, Any]) -> int:
+    """Estimate the serialized byte size of a request before it is materialized into a block."""
+    if request_tx["message_format"] == LEGACY_TRANSACTION_FORMAT:
+        transaction, _, _ = compile_legacy_transaction(request_tx)
+        return estimate_legacy_transaction_size(transaction)
+
+    transaction, _, _ = compile_v0_transaction(request_tx)
+    return estimate_v0_transaction_size(transaction)
+
+
+def build_request_scheduling_profile(request_tx: dict[str, Any]) -> dict[str, Any]:
+    """
+    Build request metadata used for mempool ordering and slot-capacity packing.
+
+    The simulator keeps this intentionally simpler than Solana's full scheduler cost model:
+    - estimated compute units act as the slot-capacity cost
+    - compute-unit price and total estimated fee drive priority ordering
+    """
+    requested_compute_unit_limit = effective_compute_unit_limit(request_tx)
+    estimated_compute_units = estimate_transaction_compute_units(request_tx["instructions"])
+    compute_unit_price_micro_lamports = request_tx["compute_budget"][
+        "compute_unit_price_micro_lamports"
+    ]
+    ordered_accounts = collect_transaction_accounts(
+        fee_payer=request_tx["fee_payer"],
+        instructions=request_tx["instructions"],
+    )
+    signature_count = sum(account["is_signer"] for account in ordered_accounts)
+    serialized_size_bytes = estimate_request_serialized_size_bytes(request_tx)
+    estimated_fee_lamports = estimate_fee_lamports(
+        signature_count=signature_count,
+        requested_compute_unit_limit=requested_compute_unit_limit,
+        compute_unit_price_micro_lamports=compute_unit_price_micro_lamports,
+    )
+    priority_fee_lamports = estimated_fee_lamports - (
+        signature_count * DEFAULT_LAMPORTS_PER_SIGNATURE
+    )
+    return {
+        "signature_count": signature_count,
+        "requested_compute_unit_limit": requested_compute_unit_limit,
+        "estimated_compute_units": estimated_compute_units,
+        "estimated_serialized_size_bytes": serialized_size_bytes,
+        "compute_unit_price_micro_lamports": compute_unit_price_micro_lamports,
+        "priority_fee_lamports": priority_fee_lamports,
+        "estimated_fee_lamports": estimated_fee_lamports,
+        "account_lock_count": len(ordered_accounts),
+        "writable_account_lock_count": sum(account["is_writable"] for account in ordered_accounts),
+        "account_locks": [account["pubkey"] for account in ordered_accounts],
+        "writable_account_locks": [
+            account["pubkey"] for account in ordered_accounts if account["is_writable"]
+        ],
+    }
+
+
+def request_priority_sort_key(request_tx: dict[str, Any]) -> tuple[int, int, int, int, int]:
+    """
+    Return a deterministic sort key for pending-request inclusion priority.
+
+    Higher fee pressure comes first. For equal fees, smaller compute estimates are favored so
+    the slot can fit more work, and earlier submissions keep their place ahead of later ties.
+    """
+    scheduling = request_tx["scheduling"]
+    return (
+        -scheduling["compute_unit_price_micro_lamports"],
+        -scheduling["priority_fee_lamports"],
+        -scheduling["estimated_fee_lamports"],
+        scheduling["estimated_compute_units"],
+        request_tx["submission_sequence"],
+    )
 
 
 def account_permission_group(account: dict[str, Any]) -> int:
@@ -2014,8 +2189,23 @@ def build_blockchain_state(
         "head_block_hash": genesis_hash,
         "head_slot": 0,
         "next_slot": 1,
+        "simulated_time_ms": 0,
         "current_epoch": 0,
-        "epoch_schedule": {"slots_per_epoch": DEFAULT_SLOTS_PER_EPOCH},
+        "epoch_schedule": {
+            "slots_per_epoch": DEFAULT_SLOTS_PER_EPOCH,
+            "target_slot_duration_ms": TARGET_SLOT_DURATION_MS,
+            "reference_mainnet_slots_per_epoch": REFERENCE_MAINNET_SLOTS_PER_EPOCH,
+        },
+        "block_limits": {
+            "max_compute_units": DEFAULT_BLOCK_COMPUTE_UNIT_LIMIT,
+            "max_packet_bytes": DEFAULT_BLOCK_PACKET_BYTES_LIMIT,
+            "max_account_locks": DEFAULT_BLOCK_ACCOUNT_LOCK_LIMIT,
+            "max_writable_account_locks": DEFAULT_BLOCK_WRITABLE_ACCOUNT_LOCK_LIMIT,
+        },
+        "simulation_config": {
+            "realistic_solana_timing": False,
+            "skip_slot_probability_bps": 0,
+        },
         "accounts": deepcopy(accounts),
         "pools": deepcopy(pools),
         "markets": deepcopy(markets),
@@ -2024,17 +2214,109 @@ def build_blockchain_state(
         "leader_schedules": {},
         "pending_requests": [],
         "processed_request_ids": [],
+        "expired_request_ids": [],
+        "submitted_request_archive": {},
+        "request_archive": {},
+        "next_request_submission_sequence": 0,
         "blocks": [],
+        "skipped_slots": [],
+        "verification_base_state": {
+            "accounts": deepcopy(accounts),
+            "pools": deepcopy(pools),
+            "markets": deepcopy(markets),
+            "players": deepcopy(players),
+            "validators": deepcopy(validators or {}),
+        },
         "stats": {
             "block_count": 0,
+            "skipped_slot_count": 0,
             "processed_request_count": 0,
             "confirmed_transaction_count": 0,
             "rejected_transaction_count": 0,
+            "expired_request_count": 0,
             "total_fees_lamports": 0,
         },
     }
     refresh_runtime_views(blockchain_state)
     return blockchain_state
+
+
+def refresh_verification_base_state(blockchain_state: dict[str, Any]) -> None:
+    """
+    Refresh the replay base state used by chain verification before block production begins.
+
+    Player and validator registration currently happen as direct simulation-state mutations rather
+    than as on-chain transactions. To let `verify_chain()` replay the produced blocks later, we
+    freeze a verification base state that mirrors the live runtime state just before the first
+    block is appended.
+    """
+    if (
+        blockchain_state["blocks"]
+        or blockchain_state["pending_requests"]
+        or blockchain_state["processed_request_ids"]
+    ):
+        return
+
+    blockchain_state["verification_base_state"] = {
+        "accounts": deepcopy(blockchain_state["accounts"]),
+        "pools": deepcopy(blockchain_state["pools"]),
+        "markets": deepcopy(blockchain_state["markets"]),
+        "players": deepcopy(blockchain_state["players"]),
+        "validators": deepcopy(blockchain_state["validators"]),
+    }
+
+
+def configure_simulation_timing(
+    blockchain_state: dict[str, Any],
+    realistic_solana_timing: bool = False,
+    slots_per_epoch: int | None = None,
+    target_slot_duration_ms: int | None = None,
+    skip_slot_probability_bps: int | None = None,
+) -> dict[str, Any]:
+    """
+    Configure logical slot and epoch timing without making the simulator sleep in real time.
+
+    `realistic_solana_timing=True` switches the schedule to Solana-like reference timing:
+    - target slot duration: 400ms
+    - slots per epoch: 8192
+
+    This remains optional because a full 8192-slot epoch is often too large for day-to-day local
+    experiments. The default lightweight mode therefore stays smaller while preserving the same
+    logical timing model.
+    """
+    if blockchain_state["blocks"] or blockchain_state["pending_requests"]:
+        raise ValueError("simulation timing can only be configured before slots start processing")
+
+    if realistic_solana_timing:
+        blockchain_state["simulation_config"]["realistic_solana_timing"] = True
+        blockchain_state["epoch_schedule"]["slots_per_epoch"] = REFERENCE_MAINNET_SLOTS_PER_EPOCH
+        blockchain_state["epoch_schedule"]["target_slot_duration_ms"] = TARGET_SLOT_DURATION_MS
+    else:
+        blockchain_state["simulation_config"]["realistic_solana_timing"] = False
+
+    if slots_per_epoch is not None:
+        if slots_per_epoch <= 0:
+            raise ValueError("slots_per_epoch must be positive")
+        blockchain_state["epoch_schedule"]["slots_per_epoch"] = slots_per_epoch
+
+    if target_slot_duration_ms is not None:
+        if target_slot_duration_ms <= 0:
+            raise ValueError("target_slot_duration_ms must be positive")
+        blockchain_state["epoch_schedule"]["target_slot_duration_ms"] = target_slot_duration_ms
+
+    if skip_slot_probability_bps is not None:
+        if skip_slot_probability_bps < 0 or skip_slot_probability_bps > 10_000:
+            raise ValueError("skip_slot_probability_bps must be between 0 and 10,000")
+        blockchain_state["simulation_config"]["skip_slot_probability_bps"] = skip_slot_probability_bps
+
+    blockchain_state["leader_schedules"].clear()
+    refresh_verification_base_state(blockchain_state)
+    return {
+        "realistic_solana_timing": blockchain_state["simulation_config"]["realistic_solana_timing"],
+        "slots_per_epoch": blockchain_state["epoch_schedule"]["slots_per_epoch"],
+        "target_slot_duration_ms": blockchain_state["epoch_schedule"]["target_slot_duration_ms"],
+        "skip_slot_probability_bps": blockchain_state["simulation_config"]["skip_slot_probability_bps"],
+    }
 
 
 def register_validator(
@@ -2077,6 +2359,7 @@ def register_validator(
     validator_copy["registered_at_slot"] = blockchain_state["head_slot"]
     blockchain_state["validators"][validator_id] = validator_copy
     blockchain_state["leader_schedules"].clear()
+    refresh_verification_base_state(blockchain_state)
     return validator_copy
 
 
@@ -2125,6 +2408,7 @@ def register_player(
     player_copy.setdefault("submitted_request_count", 0)
     player_copy.setdefault("last_active_slot", None)
     blockchain_state["players"][player_id] = player_copy
+    refresh_verification_base_state(blockchain_state)
     return player_copy
 
 
@@ -2173,6 +2457,7 @@ def set_player_status(
     player["status_updated_at_slot"] = blockchain_state["head_slot"]
     if status == REGISTRY_STATUS_DEREGISTERED:
         player["deregistered_at_slot"] = blockchain_state["head_slot"]
+    refresh_verification_base_state(blockchain_state)
     return player
 
 
@@ -2271,6 +2556,7 @@ def set_validator_status(
     if status == REGISTRY_STATUS_DEREGISTERED:
         validator["deregistered_at_slot"] = blockchain_state["head_slot"]
     blockchain_state["leader_schedules"].clear()
+    refresh_verification_base_state(blockchain_state)
     return validator
 
 
@@ -2425,6 +2711,35 @@ def select_leader_for_slot(
     return schedule["leaders_by_slot"][slot]
 
 
+def should_skip_slot(
+    blockchain_state: dict[str, Any],
+    slot: int,
+    leader_id: str,
+) -> bool:
+    """
+    Return True when the simulator should treat a slot as skipped instead of producing a block.
+
+    The decision is deterministic so replay verification can reproduce it exactly. The skip rate
+    is configured in basis points rather than by wall-clock randomness.
+    """
+    skip_slot_probability_bps = blockchain_state["simulation_config"]["skip_slot_probability_bps"]
+    if skip_slot_probability_bps <= 0:
+        return False
+
+    sample = int(
+        stable_hash(
+            {
+                "chain_id": blockchain_state["chain_id"],
+                "slot": slot,
+                "leader_id": leader_id,
+                "skip_slot_probability_bps": skip_slot_probability_bps,
+            }
+        ),
+        16,
+    ) % 10_000
+    return sample < skip_slot_probability_bps
+
+
 def finalize_validator_epoch_transitions(blockchain_state: dict[str, Any]) -> None:
     """
     Finalize validator exits whose cooldown has completed.
@@ -2465,7 +2780,8 @@ def submit_transaction_request(
     request_id = request_tx["request_id"]
     pending_request_ids = {pending_request["request_id"] for pending_request in blockchain_state["pending_requests"]}
     processed_request_ids = set(blockchain_state["processed_request_ids"])
-    if request_id in pending_request_ids or request_id in processed_request_ids:
+    expired_request_ids = set(blockchain_state["expired_request_ids"])
+    if request_id in pending_request_ids or request_id in processed_request_ids or request_id in expired_request_ids:
         raise ValueError(f"duplicate request_id: {request_id}")
 
     if blockchain_state["players"]:
@@ -2476,6 +2792,12 @@ def submit_transaction_request(
             raise ValueError(f"non-active player submitted request: {request_tx['agent_id']}")
 
     request_copy = deepcopy(request_tx)
+    request_copy["submitted_for_slot"] = blockchain_state["next_slot"]
+    request_copy["expires_after_slot"] = request_copy["submitted_for_slot"] + MAX_PROCESSING_AGE
+    request_copy["submission_sequence"] = blockchain_state["next_request_submission_sequence"]
+    blockchain_state["next_request_submission_sequence"] += 1
+    request_copy["scheduling"] = build_request_scheduling_profile(request_copy)
+    blockchain_state["submitted_request_archive"][request_id] = deepcopy(request_copy)
     blockchain_state["pending_requests"].append(request_copy)
     if request_copy["agent_id"] in blockchain_state["players"]:
         player = blockchain_state["players"][request_copy["agent_id"]]
@@ -2489,6 +2811,98 @@ def verify_block_parent_link(blockchain_state: dict[str, Any], block: dict[str, 
         block["parent_block_hash"] == blockchain_state["head_block_hash"]
         and block["slot"] == blockchain_state["next_slot"]
     )
+
+
+def request_is_expired_for_slot(request_tx: dict[str, Any], slot: int) -> bool:
+    """Return True when a pending request has aged past the recent-blockhash processing window."""
+    return slot > int(request_tx["expires_after_slot"])
+
+
+def expire_pending_requests_for_slot(
+    blockchain_state: dict[str, Any],
+    slot: int,
+) -> list[dict[str, Any]]:
+    """
+    Drop pending requests that can no longer be processed because their blockhash age expired.
+
+    This models time pressure in logical slot space rather than by sleeping in wall-clock time.
+    """
+    remaining_requests = []
+    expired_requests = []
+    for request_tx in blockchain_state["pending_requests"]:
+        if request_is_expired_for_slot(request_tx, slot):
+            expired_requests.append(request_tx)
+        else:
+            remaining_requests.append(request_tx)
+
+    if expired_requests:
+        blockchain_state["pending_requests"] = remaining_requests
+        blockchain_state["expired_request_ids"].extend(
+            request_tx["request_id"] for request_tx in expired_requests
+        )
+        blockchain_state["stats"]["expired_request_count"] += len(expired_requests)
+
+    return expired_requests
+
+
+def select_pending_requests_for_block(
+    blockchain_state: dict[str, Any],
+    max_transactions: int | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    Select the pending requests that fit into the slot's block packing budgets.
+
+    Requests are considered in fee-priority order. Requests that do not fit stay pending for a
+    later slot instead of being dropped immediately.
+    """
+    block_limits = blockchain_state["block_limits"]
+    block_compute_unit_limit = block_limits["max_compute_units"]
+    block_packet_bytes_limit = block_limits["max_packet_bytes"]
+    block_account_lock_limit = block_limits["max_account_locks"]
+    block_writable_account_lock_limit = block_limits["max_writable_account_locks"]
+    selected_requests: list[dict[str, Any]] = []
+    consumed_compute_units = 0
+    consumed_packet_bytes = 0
+    locked_accounts: set[str] = set()
+    writable_locked_accounts: set[str] = set()
+
+    for request_tx in sorted(blockchain_state["pending_requests"], key=request_priority_sort_key):
+        scheduling = request_tx["scheduling"]
+        estimated_compute_units = scheduling["estimated_compute_units"]
+        estimated_packet_bytes = scheduling["estimated_serialized_size_bytes"]
+        candidate_locked_accounts = locked_accounts | set(scheduling["account_locks"])
+        candidate_writable_locked_accounts = writable_locked_accounts | set(
+            scheduling["writable_account_locks"]
+        )
+
+        if estimated_compute_units > block_compute_unit_limit:
+            continue
+        if consumed_compute_units + estimated_compute_units > block_compute_unit_limit:
+            continue
+        if estimated_packet_bytes > block_packet_bytes_limit:
+            continue
+        if consumed_packet_bytes + estimated_packet_bytes > block_packet_bytes_limit:
+            continue
+        if len(candidate_locked_accounts) > block_account_lock_limit:
+            continue
+        if len(candidate_writable_locked_accounts) > block_writable_account_lock_limit:
+            continue
+
+        selected_requests.append(request_tx)
+        consumed_compute_units += estimated_compute_units
+        consumed_packet_bytes += estimated_packet_bytes
+        locked_accounts = candidate_locked_accounts
+        writable_locked_accounts = candidate_writable_locked_accounts
+
+        if max_transactions is not None and len(selected_requests) >= max_transactions:
+            break
+
+    return selected_requests, {
+        "compute_units_consumed": consumed_compute_units,
+        "packet_bytes_consumed": consumed_packet_bytes,
+        "account_lock_count": len(locked_accounts),
+        "writable_account_lock_count": len(writable_locked_accounts),
+    }
 
 
 def apply_system_transfer_instruction(
@@ -2832,17 +3246,22 @@ def produce_block(
     blockchain_state: dict[str, Any],
     leader_id: str | None = None,
     max_transactions: int | None = None,
+    allow_empty: bool = False,
 ) -> dict[str, Any]:
     """
     Materialize a block candidate from the current pending request queue.
 
     This previews validator processing against a copy of the current chain state so transaction
     statuses reflect sequential execution before the block is actually appended.
+
+    `allow_empty=True` is useful for the slot runner because Solana time still advances even
+    when a slot has no user transactions to include.
     """
-    if not blockchain_state["pending_requests"]:
+    slot = blockchain_state["next_slot"]
+    expired_requests = expire_pending_requests_for_slot(blockchain_state, slot)
+    if not blockchain_state["pending_requests"] and not allow_empty:
         raise ValueError("no pending requests to include in a block")
 
-    slot = blockchain_state["next_slot"]
     scheduled_leader_id = None
     if blockchain_state["validators"]:
         scheduled_leader_id = select_leader_for_slot(blockchain_state, slot)
@@ -2859,12 +3278,21 @@ def produce_block(
         if not validator_is_schedulable_for_epoch(leader, leader_epoch):
             raise ValueError(f"validator is not eligible to produce block in slot {slot}: {leader_id}")
 
-    if max_transactions is None:
-        selected_requests = list(blockchain_state["pending_requests"])
+    if not blockchain_state["pending_requests"]:
+        selected_requests = []
+        packing_stats = {
+            "compute_units_consumed": 0,
+            "packet_bytes_consumed": 0,
+            "account_lock_count": 0,
+            "writable_account_lock_count": 0,
+        }
     else:
-        selected_requests = list(blockchain_state["pending_requests"][:max_transactions])
-    if not selected_requests:
-        raise ValueError("max_transactions selected zero requests")
+        selected_requests, packing_stats = select_pending_requests_for_block(
+            blockchain_state,
+            max_transactions=max_transactions,
+        )
+    if not selected_requests and not allow_empty:
+        raise ValueError("no pending requests fit into the current block compute budget")
 
     preview_state = deepcopy(blockchain_state)
     transactions = []
@@ -2882,7 +3310,78 @@ def produce_block(
     block["included_request_ids"] = [request_tx["request_id"] for request_tx in selected_requests]
     block["scheduled_leader_id"] = scheduled_leader_id or leader_id
     block["leader_schedule_match"] = leader_id == (scheduled_leader_id or leader_id)
+    block["expired_request_count"] = len(expired_requests)
+    block["max_transactions_limit"] = max_transactions
+    block["compute_unit_limit"] = blockchain_state["block_limits"]["max_compute_units"]
+    block["compute_units_consumed"] = packing_stats["compute_units_consumed"]
+    block["compute_units_remaining"] = max(
+        block["compute_unit_limit"] - block["compute_units_consumed"],
+        0,
+    )
+    block["packet_bytes_limit"] = blockchain_state["block_limits"]["max_packet_bytes"]
+    block["packet_bytes_consumed"] = packing_stats["packet_bytes_consumed"]
+    block["packet_bytes_remaining"] = max(
+        block["packet_bytes_limit"] - block["packet_bytes_consumed"],
+        0,
+    )
+    block["account_lock_limit"] = blockchain_state["block_limits"]["max_account_locks"]
+    block["account_lock_count"] = packing_stats["account_lock_count"]
+    block["writable_account_lock_limit"] = blockchain_state["block_limits"][
+        "max_writable_account_locks"
+    ]
+    block["writable_account_lock_count"] = packing_stats["writable_account_lock_count"]
     return block
+
+
+def skip_slot(
+    blockchain_state: dict[str, Any],
+    leader_id: str | None = None,
+    reason: str = "leader_missed_slot",
+    expired_request_count: int | None = None,
+) -> dict[str, Any]:
+    """
+    Advance one slot without appending a block.
+
+    This is distinct from an empty block:
+    - empty block: a block exists for the slot, but it contains zero transactions
+    - skipped slot: no block exists for the slot at all
+
+    Pending transactions remain queued, aside from any that expire because the slot advance
+    pushed them past the recent-blockhash processing window.
+    """
+    slot = blockchain_state["next_slot"]
+    if expired_request_count is None:
+        expired_requests = expire_pending_requests_for_slot(blockchain_state, slot)
+        expired_request_count = len(expired_requests)
+
+    scheduled_leader_id = None
+    if blockchain_state["validators"]:
+        scheduled_leader_id = select_leader_for_slot(blockchain_state, slot)
+        if leader_id is None:
+            leader_id = scheduled_leader_id
+
+    slot_record = {
+        "slot": slot,
+        "scheduled_leader_id": scheduled_leader_id,
+        "leader_id": leader_id,
+        "reason": reason,
+        "expired_request_count": expired_request_count,
+        "pending_request_count_after_skip": len(blockchain_state["pending_requests"]),
+        "skipped_at_simulated_time_ms": slot * blockchain_state["epoch_schedule"]["target_slot_duration_ms"],
+    }
+    blockchain_state["skipped_slots"].append(slot_record)
+    blockchain_state["head_slot"] = slot
+    blockchain_state["next_slot"] = slot + 1
+    blockchain_state["simulated_time_ms"] = (
+        blockchain_state["head_slot"] * blockchain_state["epoch_schedule"]["target_slot_duration_ms"]
+    )
+    blockchain_state["current_epoch"] = (max(slot, 1) - 1) // blockchain_state["epoch_schedule"][
+        "slots_per_epoch"
+    ]
+    finalize_validator_epoch_transitions(blockchain_state)
+    blockchain_state["stats"]["skipped_slot_count"] += 1
+    refresh_runtime_views(blockchain_state)
+    return slot_record
 
 
 def append_block(
@@ -2902,6 +3401,7 @@ def append_block(
         request_id = transaction_record["request_id"]
         if request_id not in pending_requests_by_id:
             raise ValueError(f"block references unknown pending request: {request_id}")
+        blockchain_state["request_archive"][request_id] = deepcopy(pending_requests_by_id[request_id])
         apply_transaction_to_state(
             blockchain_state,
             pending_requests_by_id[request_id],
@@ -2920,6 +3420,9 @@ def append_block(
     blockchain_state["head_block_hash"] = block["block_hash"]
     blockchain_state["head_slot"] = block["slot"]
     blockchain_state["next_slot"] = block["slot"] + 1
+    blockchain_state["simulated_time_ms"] = (
+        blockchain_state["head_slot"] * blockchain_state["epoch_schedule"]["target_slot_duration_ms"]
+    )
     blockchain_state["current_epoch"] = (max(block["slot"], 1) - 1) // blockchain_state["epoch_schedule"][
         "slots_per_epoch"
     ]
@@ -2935,6 +3438,377 @@ def append_block(
         leader["last_produced_slot"] = block["slot"]
     refresh_runtime_views(blockchain_state)
     return block
+
+
+def normalized_transaction_for_verification(
+    transaction_record: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a transaction record with runtime-only fields removed for deterministic comparison."""
+    normalized = deepcopy(transaction_record)
+    normalized["included_at_ms"] = None
+    normalized["block_id"] = None
+    normalized["block_hash"] = None
+    return normalized
+
+
+def block_hash_payload(block: dict[str, Any]) -> dict[str, Any]:
+    """
+    Rebuild the exact payload that `create_block()` hashes before block id/hash backfills.
+
+    `create_block()` computes the block hash while transaction records still have `block_id=None`
+    and `block_hash=None`, then fills those references in afterward.
+    """
+    transactions = []
+    for transaction_record in block["transactions"]:
+        transaction_payload = deepcopy(transaction_record)
+        transaction_payload["block_id"] = None
+        transaction_payload["block_hash"] = None
+        transactions.append(transaction_payload)
+
+    return {
+        "block_id": block["block_id"],
+        "slot": block["slot"],
+        "leader_id": block["leader_id"],
+        "created_at_ms": block["created_at_ms"],
+        "parent_block_hash": block["parent_block_hash"],
+        "transaction_count": block["transaction_count"],
+        "confirmed_transaction_count": block["confirmed_transaction_count"],
+        "rejected_transaction_count": block["rejected_transaction_count"],
+        "total_fees_lamports": block["total_fees_lamports"],
+        "transactions": transactions,
+    }
+
+
+def verify_skipped_slot(
+    blockchain_state: dict[str, Any],
+    slot_record: dict[str, Any],
+) -> dict[str, Any]:
+    """Verify one skipped-slot record against the replay state's current slot and leader schedule."""
+    errors: list[str] = []
+    slot = slot_record["slot"]
+    if slot != blockchain_state["next_slot"]:
+        errors.append("skipped slot does not match the replay state's next slot")
+
+    expired_requests = expire_pending_requests_for_slot(blockchain_state, slot)
+    scheduled_leader_id = None
+    if blockchain_state["validators"]:
+        try:
+            scheduled_leader_id = select_leader_for_slot(blockchain_state, slot)
+        except ValueError as exc:
+            errors.append(f"leader schedule could not be built for skipped slot: {exc}")
+        else:
+            if slot_record.get("scheduled_leader_id") != scheduled_leader_id:
+                errors.append("skipped slot scheduled_leader_id does not match the leader schedule")
+
+    if slot_record.get("reason") != "leader_missed_slot":
+        errors.append("skipped slot reason is not supported by the current verifier")
+    if slot_record.get("expired_request_count") != len(expired_requests):
+        errors.append("skipped slot expired_request_count does not match replayed expiry count")
+    if slot_record.get("pending_request_count_after_skip") != len(blockchain_state["pending_requests"]):
+        errors.append("skipped slot pending_request_count_after_skip does not match replayed queue size")
+    expected_time_ms = slot * blockchain_state["epoch_schedule"]["target_slot_duration_ms"]
+    if slot_record.get("skipped_at_simulated_time_ms") != expected_time_ms:
+        errors.append("skipped slot simulated time does not match the slot timing model")
+
+    expected_leader_id = scheduled_leader_id if blockchain_state["validators"] else None
+    if slot_record.get("leader_id") != expected_leader_id:
+        errors.append("skipped slot leader_id does not match the skipped leader for that slot")
+
+    return {
+        "ok": not errors,
+        "slot": slot,
+        "leader_id": slot_record.get("leader_id"),
+        "scheduled_leader_id": scheduled_leader_id,
+        "error_count": len(errors),
+        "errors": errors,
+    }
+
+
+def verify_block(
+    blockchain_state: dict[str, Any],
+    block: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Verify one block against the current pre-block chain state.
+
+    This checks both structure and replay semantics:
+    - parent link and slot continuity
+    - stake-scheduled leader consistency
+    - transaction counts, fee totals, and block hash
+    - deterministic re-materialization of each transaction from its archived request
+    - sequential state-transition results inside the block
+    """
+    errors: list[str] = []
+    expired_requests = expire_pending_requests_for_slot(blockchain_state, block["slot"])
+    expected_selected_requests, expected_packing_stats = select_pending_requests_for_block(
+        blockchain_state,
+        max_transactions=block.get("max_transactions_limit"),
+    )
+    expected_selected_request_ids = [
+        request_tx["request_id"] for request_tx in expected_selected_requests
+    ]
+
+    if not verify_block_parent_link(blockchain_state, block):
+        errors.append("block does not extend the current chain head")
+
+    if block["transaction_count"] != len(block["transactions"]):
+        errors.append("block transaction_count does not match transactions length")
+    if block["confirmed_transaction_count"] != sum(
+        transaction["status"] == "confirmed" for transaction in block["transactions"]
+    ):
+        errors.append("block confirmed_transaction_count is inconsistent")
+    if block["rejected_transaction_count"] != sum(
+        transaction["status"] == "rejected" for transaction in block["transactions"]
+    ):
+        errors.append("block rejected_transaction_count is inconsistent")
+    if block["total_fees_lamports"] != sum(
+        transaction["meta"].get("fee_charged_lamports", transaction["meta"]["fee_lamports"])
+        for transaction in block["transactions"]
+    ):
+        errors.append("block total_fees_lamports is inconsistent")
+
+    expected_included_request_ids = [transaction["request_id"] for transaction in block["transactions"]]
+    if block.get("included_request_ids", expected_included_request_ids) != expected_included_request_ids:
+        errors.append("block included_request_ids do not match transaction request ids")
+    if expected_included_request_ids != expected_selected_request_ids:
+        errors.append("block included requests do not match fee-priority packing for the slot")
+    if block.get("expired_request_count", 0) != len(expired_requests):
+        errors.append("block expired_request_count does not match replayed expiry count")
+    if block.get("compute_unit_limit") != blockchain_state["block_limits"]["max_compute_units"]:
+        errors.append("block compute_unit_limit does not match the chain's configured limit")
+    if block.get("compute_units_consumed") != expected_packing_stats["compute_units_consumed"]:
+        errors.append("block compute_units_consumed does not match replayed request packing")
+    expected_compute_units_remaining = max(
+        blockchain_state["block_limits"]["max_compute_units"] - expected_packing_stats["compute_units_consumed"],
+        0,
+    )
+    if block.get("compute_units_remaining") != expected_compute_units_remaining:
+        errors.append("block compute_units_remaining does not match replayed request packing")
+    if block.get("packet_bytes_limit") != blockchain_state["block_limits"]["max_packet_bytes"]:
+        errors.append("block packet_bytes_limit does not match the chain's configured limit")
+    if block.get("packet_bytes_consumed") != expected_packing_stats["packet_bytes_consumed"]:
+        errors.append("block packet_bytes_consumed does not match replayed request packing")
+    expected_packet_bytes_remaining = max(
+        blockchain_state["block_limits"]["max_packet_bytes"] - expected_packing_stats["packet_bytes_consumed"],
+        0,
+    )
+    if block.get("packet_bytes_remaining") != expected_packet_bytes_remaining:
+        errors.append("block packet_bytes_remaining does not match replayed request packing")
+    if block.get("account_lock_limit") != blockchain_state["block_limits"]["max_account_locks"]:
+        errors.append("block account_lock_limit does not match the chain's configured limit")
+    if block.get("account_lock_count") != expected_packing_stats["account_lock_count"]:
+        errors.append("block account_lock_count does not match replayed request packing")
+    if block.get("writable_account_lock_limit") != blockchain_state["block_limits"]["max_writable_account_locks"]:
+        errors.append("block writable_account_lock_limit does not match the chain's configured limit")
+    if block.get("writable_account_lock_count") != expected_packing_stats["writable_account_lock_count"]:
+        errors.append("block writable_account_lock_count does not match replayed request packing")
+
+    expected_block_hash = stable_hash(block_hash_payload(block))
+    if block["block_hash"] != expected_block_hash:
+        errors.append("block_hash does not match the block contents")
+
+    scheduled_leader_id = None
+    if blockchain_state["validators"]:
+        try:
+            scheduled_leader_id = select_leader_for_slot(blockchain_state, block["slot"])
+        except ValueError as exc:
+            errors.append(f"leader schedule could not be built: {exc}")
+        else:
+            if block.get("scheduled_leader_id") != scheduled_leader_id:
+                errors.append("scheduled_leader_id does not match the leader schedule")
+            expected_schedule_match = block["leader_id"] == scheduled_leader_id
+            if block.get("leader_schedule_match") != expected_schedule_match:
+                errors.append("leader_schedule_match is inconsistent with the scheduled leader")
+            leader = blockchain_state["validators"].get(block["leader_id"])
+            if leader is None:
+                errors.append("block leader_id is not a registered validator")
+            else:
+                epoch = (block["slot"] - 1) // blockchain_state["epoch_schedule"]["slots_per_epoch"]
+                if not validator_is_schedulable_for_epoch(leader, epoch):
+                    errors.append("block leader is not schedulable for the block epoch")
+
+    pending_requests_by_id = {
+        request_tx["request_id"]: request_tx for request_tx in blockchain_state["pending_requests"]
+    }
+    preview_state = deepcopy(blockchain_state)
+    expected_transactions = []
+    for transaction_record in block["transactions"]:
+        if transaction_record["block_id"] != block["block_id"]:
+            errors.append(f"transaction {transaction_record['request_id']} block_id mismatch")
+        if transaction_record["block_hash"] != block["block_hash"]:
+            errors.append(f"transaction {transaction_record['request_id']} block_hash mismatch")
+
+        request_tx = pending_requests_by_id.get(transaction_record["request_id"])
+        if request_tx is None:
+            errors.append(f"missing pending request for transaction {transaction_record['request_id']}")
+            continue
+
+        expected_transaction = materialize_transaction(
+            request_tx,
+            validator_id=block["leader_id"],
+            slot=block["slot"],
+        )
+        apply_transaction_to_state(preview_state, request_tx, expected_transaction)
+        expected_transactions.append(expected_transaction)
+
+        if normalized_transaction_for_verification(expected_transaction) != normalized_transaction_for_verification(
+            transaction_record
+        ):
+            errors.append(
+                f"transaction replay mismatch for request {transaction_record['request_id']}"
+            )
+
+    if len(expected_transactions) != len(block["transactions"]):
+        errors.append("could not replay every transaction in the block")
+
+    return {
+        "ok": not errors,
+        "slot": block["slot"],
+        "leader_id": block["leader_id"],
+        "scheduled_leader_id": scheduled_leader_id,
+        "transaction_count": block["transaction_count"],
+        "error_count": len(errors),
+        "errors": errors,
+    }
+
+
+def build_chain_verification_replay_state(
+    blockchain_state: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Build a fresh replay state from the stored verification base state.
+
+    The replay state uses the current chain's `chain_id` and `genesis_hash` so stake-weighted
+    leader selection and parent-link verification match the original run.
+    """
+    base_state = blockchain_state["verification_base_state"]
+    replay_state = build_blockchain_state(
+        accounts=base_state["accounts"],
+        pools=base_state["pools"],
+        markets=base_state["markets"],
+        players=base_state["players"],
+        validators=base_state["validators"],
+    )
+    replay_state["chain_id"] = blockchain_state["chain_id"]
+    replay_state["genesis_hash"] = blockchain_state["genesis_hash"]
+    replay_state["head_block_hash"] = blockchain_state["genesis_hash"]
+    replay_state["epoch_schedule"] = deepcopy(blockchain_state["epoch_schedule"])
+    replay_state["block_limits"] = deepcopy(blockchain_state["block_limits"])
+    replay_state["simulation_config"] = deepcopy(blockchain_state["simulation_config"])
+    replay_state["verification_base_state"] = deepcopy(base_state)
+    refresh_runtime_views(replay_state)
+    return replay_state
+
+
+def verify_chain(
+    blockchain_state: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Verify the full chain by replaying blocks from the stored verification base state.
+
+    This is stronger than checking parent links alone: it re-submits archived requests at their
+    original slot, re-runs block verification, appends each verified block to a replay state, and
+    then compares the final replayed accounts, venues, registries, and chain stats to the live
+    chain state.
+    """
+    errors: list[str] = []
+    replay_state = build_chain_verification_replay_state(blockchain_state)
+    archived_requests = sorted(
+        blockchain_state["submitted_request_archive"].values(),
+        key=lambda request_tx: (
+            request_tx.get("submitted_for_slot", 0),
+            request_tx.get("submission_sequence", 0),
+        ),
+    )
+    archived_requests_by_slot: dict[int, list[dict[str, Any]]] = {}
+    for request_tx in archived_requests:
+        archived_requests_by_slot.setdefault(request_tx["submitted_for_slot"], []).append(request_tx)
+
+    block_reports = []
+    skipped_slots_by_slot = {
+        slot_record["slot"]: slot_record for slot_record in blockchain_state["skipped_slots"]
+    }
+    blocks_by_slot = {block["slot"]: block for block in blockchain_state["blocks"]}
+    skip_reports = []
+
+    for slot in range(1, blockchain_state["head_slot"] + 1):
+        for request_tx in archived_requests_by_slot.get(slot, []):
+            submit_transaction_request(replay_state, request_tx)
+
+        if slot in skipped_slots_by_slot:
+            slot_record = skipped_slots_by_slot[slot]
+            skip_report = verify_skipped_slot(replay_state, slot_record)
+            skip_reports.append(skip_report)
+            if not skip_report["ok"]:
+                errors.extend(
+                    f"slot {slot}: {error_message}" for error_message in skip_report["errors"]
+                )
+                continue
+
+            skip_slot(
+                replay_state,
+                leader_id=slot_record.get("leader_id"),
+                reason=slot_record["reason"],
+                expired_request_count=slot_record["expired_request_count"],
+            )
+            continue
+
+        block = blocks_by_slot.get(slot)
+        if block is None:
+            errors.append(f"slot {slot}: neither block nor skipped-slot record exists")
+            continue
+
+        block_report = verify_block(replay_state, block)
+        block_reports.append(block_report)
+        if not block_report["ok"]:
+            errors.extend(
+                f"slot {block['slot']}: {error_message}" for error_message in block_report["errors"]
+            )
+            continue
+
+        append_block(replay_state, block)
+
+    comparable_keys = [
+        "head_block_hash",
+        "head_slot",
+        "next_slot",
+        "simulated_time_ms",
+        "current_epoch",
+        "epoch_schedule",
+        "block_limits",
+        "simulation_config",
+        "stats",
+        "processed_request_ids",
+        "expired_request_ids",
+        "request_archive",
+        "submitted_request_archive",
+        "next_request_submission_sequence",
+        "skipped_slots",
+        "accounts",
+        "pools",
+        "markets",
+        "players",
+        "validators",
+    ]
+    live_state_matches = True
+    for key in comparable_keys:
+        if replay_state[key] != blockchain_state[key]:
+            live_state_matches = False
+            errors.append(f"replayed state does not match live state for key: {key}")
+
+    return {
+        "ok": not errors,
+        "verified_block_count": sum(report["ok"] for report in block_reports),
+        "verified_skipped_slot_count": sum(report["ok"] for report in skip_reports),
+        "block_count": len(blockchain_state["blocks"]),
+        "skipped_slot_count": len(blockchain_state["skipped_slots"]),
+        "error_count": len(errors),
+        "errors": errors,
+        "live_state_matches": live_state_matches,
+        "replayed_head_slot": replay_state["head_slot"],
+        "replayed_current_epoch": replay_state["current_epoch"],
+        "block_reports": block_reports[-10:],
+    }
 
 
 def summarize_blockchain_state(blockchain_state: dict[str, Any]) -> dict[str, Any]:
@@ -2953,11 +3827,21 @@ def summarize_blockchain_state(blockchain_state: dict[str, Any]) -> dict[str, An
         "genesis_hash": blockchain_state["genesis_hash"],
         "head_block_hash": blockchain_state["head_block_hash"],
         "head_slot": blockchain_state["head_slot"],
+        "last_block_slot": blockchain_state["blocks"][-1]["slot"] if blockchain_state["blocks"] else 0,
         "next_slot": blockchain_state["next_slot"],
+        "simulated_time_ms": blockchain_state["simulated_time_ms"],
         "current_epoch": blockchain_state["current_epoch"],
         "slots_per_epoch": blockchain_state["epoch_schedule"]["slots_per_epoch"],
+        "target_slot_duration_ms": blockchain_state["epoch_schedule"]["target_slot_duration_ms"],
+        "realistic_solana_timing": blockchain_state["simulation_config"]["realistic_solana_timing"],
+        "skip_slot_probability_bps": blockchain_state["simulation_config"]["skip_slot_probability_bps"],
+        "block_compute_unit_limit": blockchain_state["block_limits"]["max_compute_units"],
+        "block_packet_bytes_limit": blockchain_state["block_limits"]["max_packet_bytes"],
+        "block_account_lock_limit": blockchain_state["block_limits"]["max_account_locks"],
+        "block_writable_account_lock_limit": blockchain_state["block_limits"]["max_writable_account_locks"],
         "pending_request_count": len(blockchain_state["pending_requests"]),
         "block_count": len(blockchain_state["blocks"]),
+        "skipped_slot_count": len(blockchain_state["skipped_slots"]),
         "active_player_count": sum(
             player["status"] == REGISTRY_STATUS_ACTIVE
             for player in blockchain_state["players"].values()
@@ -2972,6 +3856,157 @@ def summarize_blockchain_state(blockchain_state: dict[str, Any]) -> dict[str, An
         "validator_ids": list(blockchain_state["validators"].keys()),
         "next_scheduled_leader": next_scheduled_leader,
         "stats": deepcopy(blockchain_state["stats"]),
+    }
+
+
+def summarize_block(
+    block: dict[str, Any],
+    slots_per_epoch: int,
+) -> dict[str, Any]:
+    """Return a compact summary for one produced block."""
+    return {
+        "slot": block["slot"],
+        "epoch": (block["slot"] - 1) // slots_per_epoch,
+        "leader_id": block["leader_id"],
+        "scheduled_leader_id": block.get("scheduled_leader_id"),
+        "leader_schedule_match": block.get("leader_schedule_match"),
+        "transaction_count": block["transaction_count"],
+        "confirmed_transaction_count": block["confirmed_transaction_count"],
+        "rejected_transaction_count": block["rejected_transaction_count"],
+        "expired_request_count": block.get("expired_request_count", 0),
+        "compute_unit_limit": block.get("compute_unit_limit"),
+        "compute_units_consumed": block.get("compute_units_consumed"),
+        "compute_units_remaining": block.get("compute_units_remaining"),
+        "packet_bytes_limit": block.get("packet_bytes_limit"),
+        "packet_bytes_consumed": block.get("packet_bytes_consumed"),
+        "packet_bytes_remaining": block.get("packet_bytes_remaining"),
+        "account_lock_limit": block.get("account_lock_limit"),
+        "account_lock_count": block.get("account_lock_count"),
+        "writable_account_lock_limit": block.get("writable_account_lock_limit"),
+        "writable_account_lock_count": block.get("writable_account_lock_count"),
+        "total_fees_lamports": block["total_fees_lamports"],
+        "included_request_ids": list(block.get("included_request_ids", [])),
+    }
+
+
+def summarize_blocks(
+    blocks: list[dict[str, Any]],
+    slots_per_epoch: int,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Return compact summaries for produced blocks, optionally keeping only the most recent ones."""
+    selected_blocks = blocks if limit is None else blocks[-limit:]
+    return [summarize_block(block, slots_per_epoch=slots_per_epoch) for block in selected_blocks]
+
+
+def summarize_skipped_slots(
+    skipped_slots: list[dict[str, Any]],
+    slots_per_epoch: int,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Return compact summaries for skipped slots, optionally keeping only the most recent ones."""
+    selected_slots = skipped_slots if limit is None else skipped_slots[-limit:]
+    return [
+        {
+            "slot": slot_record["slot"],
+            "epoch": (slot_record["slot"] - 1) // slots_per_epoch,
+            "leader_id": slot_record.get("leader_id"),
+            "scheduled_leader_id": slot_record.get("scheduled_leader_id"),
+            "reason": slot_record["reason"],
+            "expired_request_count": slot_record["expired_request_count"],
+            "pending_request_count_after_skip": slot_record["pending_request_count_after_skip"],
+        }
+        for slot_record in selected_slots
+    ]
+
+
+def run_simulation(
+    blockchain_state: dict[str, Any],
+    num_slots: int,
+    max_transactions_per_block: int | None = None,
+) -> dict[str, Any]:
+    """
+    Run the blockchain forward for many slots and epochs.
+
+    This is the missing step between one-shot block demos and a continuously advancing chain.
+    Each slot:
+    - active players emit any intents scheduled for that slot
+    - those intents are compiled into transaction requests and submitted to the pending queue
+    - the scheduled validator produces a block, even if it ends up empty
+    - append_block commits the slot, updates epoch state, and applies validator exit transitions
+
+    The player behavior is still deterministic template behavior for now, so this is not yet
+    the later random request loop or fully state-driven market simulation.
+    """
+    if num_slots <= 0:
+        raise ValueError("num_slots must be positive")
+
+    produced_blocks = []
+    skipped_slots = []
+    generated_request_count = 0
+    slots_with_new_requests = 0
+
+    for _ in range(num_slots):
+        slot = blockchain_state["next_slot"]
+        slot_requests = generate_slot_transaction_requests(blockchain_state, slot=slot)
+        generated_request_count += len(slot_requests)
+        if slot_requests:
+            slots_with_new_requests += 1
+        for request_tx in slot_requests:
+            submit_transaction_request(blockchain_state, request_tx)
+
+        scheduled_leader_id = (
+            select_leader_for_slot(blockchain_state, slot) if blockchain_state["validators"] else None
+        )
+        if scheduled_leader_id is not None and should_skip_slot(blockchain_state, slot, scheduled_leader_id):
+            skipped_slots.append(skip_slot(blockchain_state, leader_id=scheduled_leader_id))
+            continue
+
+        block = produce_block(
+            blockchain_state,
+            leader_id=scheduled_leader_id,
+            max_transactions=max_transactions_per_block,
+            allow_empty=True,
+        )
+        append_block(blockchain_state, block)
+        produced_blocks.append(block)
+
+    slots_per_epoch = blockchain_state["epoch_schedule"]["slots_per_epoch"]
+    epochs_touched = sorted({(block["slot"] - 1) // slots_per_epoch for block in produced_blocks})
+    epochs_touched.extend(
+        (slot_record["slot"] - 1) // slots_per_epoch
+        for slot_record in skipped_slots
+    )
+    epochs_touched = sorted(set(epochs_touched))
+    return {
+        "start_slot": blockchain_state["head_slot"] - num_slots + 1,
+        "end_slot": blockchain_state["head_slot"],
+        "slot_count": num_slots,
+        "produced_block_count": len(produced_blocks),
+        "skipped_slot_count": len(skipped_slots),
+        "epochs_touched": epochs_touched,
+        "simulated_time_ms": blockchain_state["simulated_time_ms"],
+        "generated_request_count": generated_request_count,
+        "slots_with_new_requests": slots_with_new_requests,
+        "empty_block_count": sum(block["transaction_count"] == 0 for block in produced_blocks),
+        "expired_request_count": sum(block.get("expired_request_count", 0) for block in produced_blocks),
+        "confirmed_transaction_count": sum(
+            block["confirmed_transaction_count"] for block in produced_blocks
+        ),
+        "rejected_transaction_count": sum(
+            block["rejected_transaction_count"] for block in produced_blocks
+        ),
+        "total_fees_lamports": sum(block["total_fees_lamports"] for block in produced_blocks),
+        "recent_blocks": summarize_blocks(
+            produced_blocks,
+            slots_per_epoch=slots_per_epoch,
+            limit=min(10, len(produced_blocks)),
+        ),
+        "recent_skipped_slots": summarize_skipped_slots(
+            skipped_slots,
+            slots_per_epoch=slots_per_epoch,
+            limit=min(10, len(skipped_slots)),
+        ),
     }
 
 
@@ -3554,11 +4589,10 @@ def sample_block_from_requests(
 def main() -> None:
     pools = sample_pools()
     markets = sample_markets()
+    accounts = sample_accounts()
     players = sample_players()
     validators = sample_validators()
-    player_intents = sample_player_intents(players, pools, markets)
-    accounts = sample_accounts()
-    requests = sample_transaction_requests(player_intents, players, pools, markets)
+    base_player_intents = sample_player_intents(players, pools, markets)
     blockchain_state = build_blockchain_state(
         accounts=accounts,
         pools=pools,
@@ -3569,10 +4603,11 @@ def main() -> None:
         register_player(blockchain_state, player)
     for validator in validators.values():
         register_validator(blockchain_state, validator)
-    for request_tx in requests:
-        submit_transaction_request(blockchain_state, request_tx)
-    block = produce_block(blockchain_state)
-    append_block(blockchain_state, block)
+    simulation_result = run_simulation(
+        blockchain_state,
+        num_slots=DEFAULT_SLOTS_PER_EPOCH * 2,
+    )
+    verification_report = verify_chain(blockchain_state)
 
     print("POOLS")
     print(to_json(pools))
@@ -3580,29 +4615,45 @@ def main() -> None:
     print("MARKETS")
     print(to_json(markets))
     print()
-    print("PLAYERS")
-    print(to_json(players))
+    print("REGISTERED PLAYERS")
+    print(to_json(blockchain_state["players"]))
     print()
-    print("VALIDATORS")
+    print("REGISTERED VALIDATORS")
     print(to_json(blockchain_state["validators"]))
     print()
-    print("PLAYER INTENTS")
-    print(to_json(player_intents))
+    print("BASE PLAYER INTENTS")
+    print(to_json(base_player_intents))
     print()
-    print("INITIAL ACCOUNTS")
-    print(to_json(accounts))
-    print()
-    print("TRANSACTION REQUESTS")
-    print(to_json(requests))
+    print("SIMULATION RESULT")
+    print(to_json(simulation_result))
     print()
     print("BLOCKCHAIN STATE SUMMARY")
     print(to_json(summarize_blockchain_state(blockchain_state)))
     print()
-    print("CHAIN ACCOUNTS")
-    print(to_json(blockchain_state["accounts"]))
+    print("CHAIN VERIFICATION")
+    print(to_json(verification_report))
     print()
-    print("FINALIZED BLOCK")
-    print(to_json(blockchain_state["blocks"][-1]))
+    print("RECENT BLOCKS")
+    print(
+        to_json(
+            summarize_blocks(
+                blockchain_state["blocks"],
+                slots_per_epoch=blockchain_state["epoch_schedule"]["slots_per_epoch"],
+                limit=10,
+            )
+        )
+    )
+    print()
+    print("RECENT SKIPPED SLOTS")
+    print(
+        to_json(
+            summarize_skipped_slots(
+                blockchain_state["skipped_slots"],
+                slots_per_epoch=blockchain_state["epoch_schedule"]["slots_per_epoch"],
+                limit=10,
+            )
+        )
+    )
 
 
 if __name__ == "__main__":
