@@ -13,6 +13,7 @@ Aims/todos:
 - create a way to resolve conflicts between chains
 - create a way to register nodes in the network
 - create a way to reach consensus between nodes
+- build a persistent simulation state / blockchain state for PoS, PoH, consensus to act on
 - replace fixed sample generators with state-driven ones so they react to pool prices, inventory, spreads, and validator conditions instead of emitting hard-coded intents (partially done?)
 - create liquidity pools and a way to swap between them (done?)
 - create a random transaction request loop to test the blockchain
