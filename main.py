@@ -678,7 +678,32 @@ def compile_v0_transaction(
 
 
 def estimate_compiled_instruction_size(compiled_instruction: dict[str, Any]) -> int:
-    """Estimate the serialized size of one compiled instruction inside a Solana message."""
+    """
+    Estimate the serialized size of one compiled instruction inside a Solana message.
+    The first byte is the program_id_index, then comes a shortvec-prefixed list of account indices,
+    and finally a shortvec-prefixed list of instruction data bytes. In total:
+    
+    program_id_index — 1 fixed byte
+    num_accounts — compact-u16 / shortvec
+    account_indices — num_accounts bytes
+    data_len — compact-u16 / shortvec
+    data — data_len bytes
+
+    program_id_index is the index into the transaction's account-key list telling the runtime
+    which program executes the instruction
+    
+    len(compiled_instruction["accounts"]) is the number of accounts the instruction touches.
+    It is enough to use len() here because the account indices are used and not the full public keys.
+    The indexing is into the transaction's account key list, which is limited to 256 accounts.
+    
+    len(compiled_instruction["data"]) is the number of bytes in the instruction data payload, 
+    which is limited to 10,240 bytes by our simulator and Solana's current limits. It is
+    enough to use len() here because the instruction data is used as raw bytes 
+    and not interpreted as higher-level types.
+
+    Reader walks through the account indices and data bytes by first reading the shortvec length
+    prefixes, which tell how many bytes to read for each section.
+    """
     return (
         1
         + shortvec_length(len(compiled_instruction["accounts"]))
@@ -690,7 +715,7 @@ def estimate_compiled_instruction_size(compiled_instruction: dict[str, Any]) -> 
 
 def estimate_legacy_transaction_size(transaction: dict[str, Any]) -> int:
     """
-    Estimate serialized byte size for a legacy transaction.
+    Estimate serialized byte size for a legacy transaction (not just one instruction).
 
     Formula:
     - shortvec length of the signature count
@@ -701,6 +726,15 @@ def estimate_legacy_transaction_size(transaction: dict[str, Any]) -> int:
     - 32 bytes for the recent blockhash
     - shortvec length of the instruction count
     - size of each compiled instruction
+
+    The 3 bytes is for: num_required_signatures + num_readonly_signed_accounts + num_readonly_unsigned_accounts.
+
+    Our simulator may use placeholder hex strings (for example from blake2b) to represent
+    pubkeys, blockhashes, or signatures. That does not affect this estimator because it does
+    not use the string lengths of those values; it uses Solana's actual serialized wire sizes:
+    32 bytes per pubkey, 32 bytes per recent blockhash, and 64 bytes per signature. However,
+    any variable-length byte fields (such as instruction data) must be measured in actual bytes,
+    not hex-character length.
     """
     message = transaction["message"]
     message_size = (
@@ -736,6 +770,16 @@ def estimate_v0_transaction_size(transaction: dict[str, Any]) -> int:
     - shortvec length of the address table lookup count
     - for each lookup: 32 bytes for the lookup table address plus shortvec-prefixed writable
       and readonly index arrays
+      
+    A lookup table is added, so some account keys are moved from the static account key list into the address table lookups section. 
+    The static account keys still use 32 bytes each, but the lookup accounts only use 1 byte each because they are indices into 
+    the lookup table. Each lookup also adds 32 bytes for the lookup table address and some additional bytes for the shortvec 
+    lengths of the writable and readonly index arrays.
+    
+    The version prefix byte can not equal the first byte of the legacy message header, this is ensured as the version prefix is 0x80,
+    and the legacy message header's first byte is a shortvec encoding of the signature count,
+    and as Solana’s transaction limits cap signatures per packet at 12, the legacy first byte is effectively in the range 0..12, 
+    which keeps the top bit clear (top bit is 1 for v0, 0 for legacy).
     """
     message = transaction["message"]
     lookup_size = shortvec_length(len(message["address_table_lookups"]))
