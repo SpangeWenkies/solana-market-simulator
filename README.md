@@ -4,6 +4,7 @@ Simulate solana blockchain through players -> intent -> requests -> validation -
 This is a project to learn what it takes to be a blockchain network and to evaluate what types of behaviour changes what in the market.
 
 Aims/todos:
+- create players (players, accounts, markets, intents partially done?)
 - create chain that stores subsequent blocks
 - create proof of stake algorithm
 - create proof of history algorithm (maybe this is the same as verifying the chain is valid)
