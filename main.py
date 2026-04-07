@@ -76,12 +76,40 @@ VERSIONED_V0_TRANSACTION_FORMAT = "v0"
 # It also appears as the owner of accounts whose data that program controls.
 
 SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
+TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 STAKE_PROGRAM_ID = "Stake11111111111111111111111111111111111111"
 VOTE_PROGRAM_ID = "Vote111111111111111111111111111111111111111"
 CONFIG_PROGRAM_ID = "Config1111111111111111111111111111111111111"
 COMPUTE_BUDGET_PROGRAM_ID = "ComputeBudget111111111111111111111111111111"
 ADDRESS_LOOKUP_TABLE_PROGRAM_ID = "AddressLookupTab1e1111111111111111111111111"
+AMM_SIM_PROGRAM_ID = "AmmSim111111111111111111111111111111111111"
 MARKET_SIM_PROGRAM_ID = "MarketSim1111111111111111111111111111111111"
+
+# Later change some of these into enums or more structured types if it seems helpful, but for now we can just use string constants.
+
+SWAP_MODE_EXACT_INPUT = "exact_in"
+SWAP_MODE_EXACT_OUTPUT = "exact_out"
+
+POOL_TYPE_CONSTANT_PRODUCT = "constant_product"
+POOL_TYPE_STABLE_SWAP = "stable_swap"
+POOL_TYPE_WEIGHTED = "weighted"
+
+MARKET_SIDE_BUY = "buy"
+MARKET_SIDE_SELL = "sell"
+MARKET_ORDER_TYPE_MARKET = "market"
+MARKET_ORDER_TYPE_LIMIT = "limit"
+
+PLAYER_TYPE_MARKET_MAKER = "market_maker"
+PLAYER_TYPE_LIQUIDITY_PROVIDER = "liquidity_provider"
+PLAYER_TYPE_RETAIL_USER = "retail_user"
+PLAYER_TYPE_ARBITRAGEUR = "arbitrageur"
+PLAYER_TYPE_ROUTER = "router"
+PLAYER_TYPE_REBALANCER = "rebalancer"
+
+INTENT_TYPE_SYSTEM_TRANSFER = "system_transfer"
+INTENT_TYPE_POOL_SWAP = "pool_swap"
+INTENT_TYPE_POOL_LIQUIDITY_ADD = "pool_liquidity_add"
+INTENT_TYPE_MARKET_TRADE = "market_trade"
 
 # Builtin programs are core programs provided by the Solana runtime itself rather than by a
 # user-deployed BPF/ELF program. Their scheduling and default compute treatment differ.
@@ -257,17 +285,32 @@ def encode_system_transfer_data(lamports: int) -> list[int]:
     return list(struct.pack("<IQ", 2, lamports))
 
 
-def encode_market_swap_data(side: str, amount_in: int, min_amount_out: int) -> list[int]:
-    if side == "buy":
-        side_flag = 0
-    elif side == "sell":
-        side_flag = 1
+def encode_pool_swap_data(
+    swap_mode: str,
+    amount: int,
+    other_amount_threshold: int,
+) -> list[int]:
+    """
+    Encode a generic AMM swap payload.
+
+    `swap_mode` controls whether `amount` is interpreted as the exact input amount or the
+    exact output amount. `other_amount_threshold` is the slippage guard on the opposite side:
+    - exact_in: minimum acceptable output amount
+    - exact_out: maximum acceptable input amount
+
+    The pool itself determines the pricing curve from its on-chain state, so the instruction
+    data does not need to include pool type or a buy/sell flag.
+    """
+    if swap_mode == SWAP_MODE_EXACT_INPUT:
+        swap_mode_flag = 0
+    elif swap_mode == SWAP_MODE_EXACT_OUTPUT:
+        swap_mode_flag = 1
     else:
-        raise ValueError("side must be 'buy' or 'sell'")
+        raise ValueError("swap_mode must be 'exact_in' or 'exact_out'")
     # We use `struct.pack` to produce deterministic binary instruction data.
-    # "<BQQ" means little-endian: `B` = 1-byte side flag, then two `Q` values for the
-    # 8-byte unsigned integers `amount_in` and `min_amount_out`.
-    return list(struct.pack("<BQQ", side_flag, amount_in, min_amount_out))
+    # "<BQQ" means little-endian: `B` = 1-byte swap mode flag, then two `Q` values for the
+    # 8-byte unsigned integers `amount` and `other_amount_threshold`.
+    return list(struct.pack("<BQQ", swap_mode_flag, amount, other_amount_threshold))
 
 
 def build_system_transfer_instruction(
@@ -285,44 +328,217 @@ def build_system_transfer_instruction(
     )
 
 
+def build_pool_swap_instruction(
+    trader_authority: str,
+    trader_source_account: str,
+    trader_destination_account: str,
+    pool_state: str,
+    pool_vaults: list[str],
+    pool_lp_mint: str,
+    pool_fee_vault: str,
+    swap_mode: str,
+    amount: int,
+    other_amount_threshold: int,
+    oracle_account: str | None = None,
+) -> dict[str, Any]:
+    """
+    Build a generic AMM pool-swap instruction for the simulator.
+
+    This represents a trader swapping against a pool program. The instruction
+    includes:
+    - the trader authority account that signs
+    - the trader's source and destination token accounts
+    - the pool state account that defines the pricing curve and fee rules
+    - pool vault accounts that hold the pooled assets
+    - the LP mint and fee vault for pool accounting
+    - an optional oracle account for pricing or guard-rail logic
+
+    The same instruction shape can be used for:
+    - constant product pools
+    - stable swap pools
+    - weighted / multi-token pools
+
+    The difference between those pool types lives in the pool state, not in the swap
+    instruction arguments.
+    """
+    accounts = [
+        build_account_meta(trader_authority, is_signer=True, is_writable=False),
+        build_account_meta(trader_source_account, is_signer=False, is_writable=True),
+        build_account_meta(trader_destination_account, is_signer=False, is_writable=True),
+        build_account_meta(pool_state, is_signer=False, is_writable=True),
+    ]
+    accounts.extend(
+        build_account_meta(pool_vault, is_signer=False, is_writable=True)
+        for pool_vault in pool_vaults
+    )
+    accounts.extend(
+        [
+            build_account_meta(pool_lp_mint, is_signer=False, is_writable=False),
+            build_account_meta(pool_fee_vault, is_signer=False, is_writable=True),
+        ]
+    )
+    if oracle_account is not None:
+        accounts.append(build_account_meta(oracle_account, is_signer=False, is_writable=False))
+
+    return build_instruction(
+        program_id=AMM_SIM_PROGRAM_ID,
+        accounts=accounts,
+        data=encode_pool_swap_data(swap_mode, amount, other_amount_threshold),
+    )
+
+
+def encode_pool_liquidity_add_data(
+    max_token_a_amount: int,
+    max_token_b_amount: int,
+    min_lp_tokens_out: int,
+) -> list[int]:
+    """
+    Encode a minimal two-token liquidity-add payload.
+
+    This is a first LP-oriented instruction shape for the simulator:
+    - the LP supplies up to two token amounts
+    - the LP expects at least some minimum LP shares back
+    """
+    return list(struct.pack("<QQQ", max_token_a_amount, max_token_b_amount, min_lp_tokens_out))
+
+
+def build_pool_liquidity_add_instruction(
+    trader_authority: str,
+    trader_source_accounts: list[str],
+    pool_state: str,
+    pool_vaults: list[str],
+    pool_lp_mint: str,
+    trader_lp_receipt_account: str,
+    pool_fee_vault: str,
+    max_token_amounts: list[int],
+    min_lp_tokens_out: int,
+    oracle_account: str | None = None,
+) -> dict[str, Any]:
+    """
+    Build a minimal LP deposit instruction for a two-token pool.
+
+    This gives liquidity providers a distinct on-chain interaction pattern from traders:
+    they contribute assets to pool vaults and receive LP tokens instead of swapping one
+    asset for another.
+    """
+    if len(trader_source_accounts) != 2 or len(pool_vaults) != 2 or len(max_token_amounts) != 2:
+        raise ValueError("pool_liquidity_add currently supports exactly two pool assets")
+
+    accounts = [
+        build_account_meta(trader_authority, is_signer=True, is_writable=False),
+        build_account_meta(trader_source_accounts[0], is_signer=False, is_writable=True),
+        build_account_meta(trader_source_accounts[1], is_signer=False, is_writable=True),
+        build_account_meta(pool_state, is_signer=False, is_writable=True),
+        build_account_meta(pool_vaults[0], is_signer=False, is_writable=True),
+        build_account_meta(pool_vaults[1], is_signer=False, is_writable=True),
+        build_account_meta(pool_lp_mint, is_signer=False, is_writable=True),
+        build_account_meta(trader_lp_receipt_account, is_signer=False, is_writable=True),
+        build_account_meta(pool_fee_vault, is_signer=False, is_writable=True),
+    ]
+    if oracle_account is not None:
+        accounts.append(build_account_meta(oracle_account, is_signer=False, is_writable=False))
+
+    return build_instruction(
+        program_id=AMM_SIM_PROGRAM_ID,
+        accounts=accounts,
+        data=encode_pool_liquidity_add_data(
+            max_token_a_amount=max_token_amounts[0],
+            max_token_b_amount=max_token_amounts[1],
+            min_lp_tokens_out=min_lp_tokens_out,
+        ),
+    )
+
+
+def encode_market_swap_data(
+    side: str,
+    order_type: str,
+    base_amount: int,
+    quote_amount_limit: int,
+    limit_price: int = 0,
+) -> list[int]:
+    """
+    Encode an orderbook-style market interaction payload.
+
+    This is separate from pool swaps. Here the simulator assumes the instruction interacts
+    with a market state containing bids, asks, an event queue, and open-orders state.
+
+    Fields:
+    - `side`: buy or sell
+    - `order_type`: market or limit
+    - `base_amount`: amount of the base asset the trader wants to trade
+    - `quote_amount_limit`: max quote spent for buys or min quote received for sells
+    - `limit_price`: optional price guard for limit orders; zero for market orders
+    """
+    if side == MARKET_SIDE_BUY:
+        side_flag = 0
+    elif side == MARKET_SIDE_SELL:
+        side_flag = 1
+    else:
+        raise ValueError("side must be 'buy' or 'sell'")
+
+    if order_type == MARKET_ORDER_TYPE_MARKET:
+        order_type_flag = 0
+    elif order_type == MARKET_ORDER_TYPE_LIMIT:
+        order_type_flag = 1
+    else:
+        raise ValueError("order_type must be 'market' or 'limit'")
+
+    return list(struct.pack("<BBQQQ", side_flag, order_type_flag, base_amount, quote_amount_limit, limit_price))
+
+
 def build_market_swap_instruction(
-    trader: str,
+    trader_authority: str,
+    trader_base_account: str,
+    trader_quote_account: str,
     open_orders: str,
     event_queue: str,
     market_state: str,
     bids: str,
     asks: str,
-    oracle: str,
-    usdc_vault: str,
-    sol_vault: str,
-    amount_in: int,
-    min_amount_out: int,
+    base_vault: str,
+    quote_vault: str,
+    oracle_account: str,
+    side: str,
+    order_type: str,
+    base_amount: int,
+    quote_amount_limit: int,
+    limit_price: int = 0,
 ) -> dict[str, Any]:
     """
-    Build a sample non-builtin market instruction for the simulator.
+    Build an orderbook-style market instruction for the simulator.
 
-    This represents a trader submitting a swap against a market program. The instruction
-    includes:
-    - the trader authority account that signs
-    - writable market-side state such as open orders and event queue
-    - read-only market reference accounts such as bids, asks, and oracle
-    - token vaults that the program may debit or credit
-    - binary data describing the trade side and quantity constraints
+    Unlike an AMM pool swap, this instruction assumes the program maintains explicit market
+    state:
+    - open orders per trader
+    - bids and asks books
+    - an event queue for fills and cancellations
+    - market vaults that hold settlement assets
+
+    This lets the simulator support player types such as market makers, retail traders,
+    routers, and arbitrageurs that may interact with both CLOB-like markets and AMM pools.
     """
     return build_instruction(
         program_id=MARKET_SIM_PROGRAM_ID,
         accounts=[
-            build_account_meta(trader, is_signer=True, is_writable=True),
+            build_account_meta(trader_authority, is_signer=True, is_writable=False),
+            build_account_meta(trader_base_account, is_signer=False, is_writable=True),
+            build_account_meta(trader_quote_account, is_signer=False, is_writable=True),
             build_account_meta(open_orders, is_signer=False, is_writable=True),
             build_account_meta(event_queue, is_signer=False, is_writable=True),
-            build_account_meta(market_state, is_signer=False, is_writable=False),
-            build_account_meta(bids, is_signer=False, is_writable=False),
-            build_account_meta(asks, is_signer=False, is_writable=False),
-            build_account_meta(oracle, is_signer=False, is_writable=False),
-            build_account_meta(usdc_vault, is_signer=False, is_writable=True),
-            build_account_meta(sol_vault, is_signer=False, is_writable=True),
+            build_account_meta(market_state, is_signer=False, is_writable=True),
+            build_account_meta(bids, is_signer=False, is_writable=True),
+            build_account_meta(asks, is_signer=False, is_writable=True),
+            build_account_meta(base_vault, is_signer=False, is_writable=True),
+            build_account_meta(quote_vault, is_signer=False, is_writable=True),
+            build_account_meta(oracle_account, is_signer=False, is_writable=False),
         ],
-        data=encode_market_swap_data("buy", amount_in, min_amount_out),
+        data=encode_market_swap_data(
+            side=side,
+            order_type=order_type,
+            base_amount=base_amount,
+            quote_amount_limit=quote_amount_limit,
+            limit_price=limit_price,
+        ),
     )
 
 
@@ -368,6 +584,581 @@ def build_transaction_request(
 def is_builtin_program(program_id: str) -> bool:
     """Return True when the instruction targets a runtime-provided builtin program."""
     return program_id in NON_MIGRATED_BUILTIN_PROGRAM_IDS
+
+
+def build_pool_definition(
+    pool_name: str,
+    pool_type: str,
+    pool_state_account: str,
+    pool_vault_accounts: list[str],
+    pool_lp_mint: str,
+    pool_fee_vault: str,
+    token_symbols: list[str],
+    oracle_account: str | None = None,
+    amplification_factor: int | None = None,
+    normalized_weights_bps: list[int] | None = None,
+) -> dict[str, Any]:
+    """
+    Build decoded pool metadata for the simulator.
+
+    The instruction accounts point to on-chain state, but the simulator also benefits from a
+    decoded pool object that tells us what curve the pool uses:
+    - constant product pools rely on reserve balances
+    - stable swap pools also need an amplification parameter
+    - weighted pools need normalized token weights and may have more than two vaults
+    """
+    return {
+        "pool_name": pool_name,
+        "pool_type": pool_type,
+        "pool_state_account": pool_state_account,
+        "pool_vault_accounts": list(pool_vault_accounts),
+        "pool_lp_mint": pool_lp_mint,
+        "pool_fee_vault": pool_fee_vault,
+        "token_symbols": list(token_symbols),
+        "oracle_account": oracle_account,
+        "amplification_factor": amplification_factor,
+        "normalized_weights_bps": list(normalized_weights_bps or []),
+    }
+
+
+def build_market_definition(
+    market_name: str,
+    market_state_account: str,
+    open_orders_account: str,
+    event_queue_account: str,
+    bids_account: str,
+    asks_account: str,
+    base_vault_account: str,
+    quote_vault_account: str,
+    oracle_account: str,
+    base_symbol: str,
+    quote_symbol: str,
+) -> dict[str, Any]:
+    """
+    Build decoded market metadata for an orderbook-style venue in the simulator.
+
+    This sits alongside pool definitions so the overall simulator can support both:
+    - pool-based swaps
+    - orderbook / market-based trading
+    """
+    return {
+        "market_name": market_name,
+        "market_state_account": market_state_account,
+        "open_orders_account": open_orders_account,
+        "event_queue_account": event_queue_account,
+        "bids_account": bids_account,
+        "asks_account": asks_account,
+        "base_vault_account": base_vault_account,
+        "quote_vault_account": quote_vault_account,
+        "oracle_account": oracle_account,
+        "base_symbol": base_symbol,
+        "quote_symbol": quote_symbol,
+    }
+
+
+def build_player_profile(
+    player_id: str,
+    player_type: str,
+    authority_account: str,
+    token_accounts: dict[str, str] | None = None,
+    default_message_format: str = LEGACY_TRANSACTION_FORMAT,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Build a simulator-side player profile.
+
+    A player profile lives above the on-chain layer. It describes who the actor is, which
+    authority account they control, and which token accounts they typically use. Players do
+    not directly become transactions; they generate intents, and those intents are later
+    compiled into Solana-style transaction requests.
+    """
+    return {
+        "player_id": player_id,
+        "player_type": player_type,
+        "authority_account": authority_account,
+        "token_accounts": dict(token_accounts or {}),
+        "default_message_format": default_message_format,
+        "metadata": metadata or {},
+    }
+
+
+def build_player_intent(
+    player_id: str,
+    intent_type: str,
+    parameters: dict[str, Any],
+    venue_type: str = "system",
+    venue_id: str | None = None,
+    execution_preferences: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Build a high-level intent generated by a simulated player.
+
+    This is the separation point between strategy behavior and on-chain execution:
+    - intent layer: "what the player wants to do"
+    - request layer: "how that becomes a Solana transaction"
+
+    The compiler later translates an intent into concrete instructions, account metas,
+    message format choices, and fee preferences.
+    """
+    return {
+        "intent_id": make_id("intent"),
+        "player_id": player_id,
+        "intent_type": intent_type,
+        "venue_type": venue_type,
+        "venue_id": venue_id,
+        "parameters": deepcopy(parameters),
+        "execution_preferences": deepcopy(execution_preferences or {}),
+        "metadata": metadata or {},
+    }
+
+
+def build_lookup_tables_for_intent(
+    intent: dict[str, Any],
+    pools: dict[str, dict[str, Any]],
+    markets: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Build any v0 address lookup tables needed for a compiled intent.
+
+    Intents stay high-level. Lookup tables are execution details, so they are resolved only
+    when the intent is compiled into a request.
+    """
+    execution_preferences = intent["execution_preferences"]
+    if execution_preferences.get("message_format") != VERSIONED_V0_TRANSACTION_FORMAT:
+        return []
+
+    lookup_table_account = execution_preferences.get("lookup_table_account")
+    if lookup_table_account is None:
+        return []
+
+    if intent["intent_type"] in {INTENT_TYPE_POOL_SWAP, INTENT_TYPE_POOL_LIQUIDITY_ADD}:
+        pool = pools[intent["venue_id"]]
+        addresses = [
+            pool["pool_state_account"],
+            *pool["pool_vault_accounts"],
+            pool["pool_lp_mint"],
+            pool["pool_fee_vault"],
+        ]
+        if pool["oracle_account"] is not None:
+            addresses.append(pool["oracle_account"])
+        return [build_address_lookup_table(account_key=lookup_table_account, addresses=addresses)]
+
+    if intent["intent_type"] == INTENT_TYPE_MARKET_TRADE:
+        market = markets[intent["venue_id"]]
+        return [
+            build_address_lookup_table(
+                account_key=lookup_table_account,
+                addresses=[
+                    market["open_orders_account"],
+                    market["event_queue_account"],
+                    market["market_state_account"],
+                    market["bids_account"],
+                    market["asks_account"],
+                    market["base_vault_account"],
+                    market["quote_vault_account"],
+                    market["oracle_account"],
+                ],
+            )
+        ]
+
+    return []
+
+
+def compile_player_intent_to_request(
+    intent: dict[str, Any],
+    players: dict[str, dict[str, Any]],
+    pools: dict[str, dict[str, Any]],
+    markets: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Compile one player intent into a transaction request.
+
+    This function is the bridge between the strategic simulation layer and the blockchain
+    execution layer. Different player types can emit different intents, but once compiled they
+    all become concrete Solana-style transaction requests that validators can process.
+    """
+    player = players[intent["player_id"]]
+    parameters = intent["parameters"]
+    execution_preferences = intent["execution_preferences"]
+
+    if intent["intent_type"] == INTENT_TYPE_SYSTEM_TRANSFER:
+        instructions = [
+            build_system_transfer_instruction(
+                sender=player["authority_account"],
+                recipient=parameters["recipient"],
+                lamports=parameters["lamports"],
+            )
+        ]
+    elif intent["intent_type"] == INTENT_TYPE_POOL_SWAP:
+        pool = pools[intent["venue_id"]]
+        instructions = [
+            build_pool_swap_instruction(
+                trader_authority=player["authority_account"],
+                trader_source_account=player["token_accounts"][parameters["source_symbol"]],
+                trader_destination_account=player["token_accounts"][parameters["destination_symbol"]],
+                pool_state=pool["pool_state_account"],
+                pool_vaults=pool["pool_vault_accounts"],
+                pool_lp_mint=pool["pool_lp_mint"],
+                pool_fee_vault=pool["pool_fee_vault"],
+                swap_mode=parameters["swap_mode"],
+                amount=parameters["amount"],
+                other_amount_threshold=parameters["other_amount_threshold"],
+                oracle_account=pool["oracle_account"],
+            )
+        ]
+    elif intent["intent_type"] == INTENT_TYPE_POOL_LIQUIDITY_ADD:
+        pool = pools[intent["venue_id"]]
+        if len(pool["token_symbols"]) != 2:
+            raise ValueError("pool_liquidity_add currently supports exactly two-token pools")
+        instructions = [
+            build_pool_liquidity_add_instruction(
+                trader_authority=player["authority_account"],
+                trader_source_accounts=[
+                    player["token_accounts"][pool["token_symbols"][0]],
+                    player["token_accounts"][pool["token_symbols"][1]],
+                ],
+                pool_state=pool["pool_state_account"],
+                pool_vaults=pool["pool_vault_accounts"],
+                pool_lp_mint=pool["pool_lp_mint"],
+                trader_lp_receipt_account=parameters["lp_receipt_account"],
+                pool_fee_vault=pool["pool_fee_vault"],
+                max_token_amounts=parameters["max_token_amounts"],
+                min_lp_tokens_out=parameters["min_lp_tokens_out"],
+                oracle_account=pool["oracle_account"],
+            )
+        ]
+    elif intent["intent_type"] == INTENT_TYPE_MARKET_TRADE:
+        market = markets[intent["venue_id"]]
+        instructions = [
+            build_market_swap_instruction(
+                trader_authority=player["authority_account"],
+                trader_base_account=player["token_accounts"][market["base_symbol"]],
+                trader_quote_account=player["token_accounts"][market["quote_symbol"]],
+                open_orders=market["open_orders_account"],
+                event_queue=market["event_queue_account"],
+                market_state=market["market_state_account"],
+                bids=market["bids_account"],
+                asks=market["asks_account"],
+                base_vault=market["base_vault_account"],
+                quote_vault=market["quote_vault_account"],
+                oracle_account=market["oracle_account"],
+                side=parameters["side"],
+                order_type=parameters["order_type"],
+                base_amount=parameters["base_amount"],
+                quote_amount_limit=parameters["quote_amount_limit"],
+                limit_price=parameters.get("limit_price", 0),
+            )
+        ]
+    else:
+        raise ValueError(f"unsupported intent_type: {intent['intent_type']}")
+
+    return build_transaction_request(
+        agent_id=player["player_id"],
+        fee_payer=player["authority_account"],
+        instructions=instructions,
+        message_format=execution_preferences.get(
+            "message_format", player["default_message_format"]
+        ),
+        address_lookup_tables=build_lookup_tables_for_intent(intent, pools, markets),
+        requested_compute_unit_limit=execution_preferences.get("requested_compute_unit_limit"),
+        compute_unit_price_micro_lamports=execution_preferences.get(
+            "compute_unit_price_micro_lamports", 0
+        ),
+        metadata={
+            "intent_id": intent["intent_id"],
+            "player_id": player["player_id"],
+            "player_type": player["player_type"],
+            "intent_type": intent["intent_type"],
+            "venue_type": intent["venue_type"],
+            "venue_id": intent["venue_id"],
+            **player["metadata"],
+            **intent["metadata"],
+        },
+    )
+
+
+def compile_player_intents_to_requests(
+    intents: list[dict[str, Any]],
+    players: dict[str, dict[str, Any]],
+    pools: dict[str, dict[str, Any]],
+    markets: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compile a list of player intents into transaction requests."""
+    return [
+        compile_player_intent_to_request(intent, players, pools, markets)
+        for intent in intents
+    ]
+
+
+def generate_market_maker_intents(
+    player: dict[str, Any],
+    pools: dict[str, dict[str, Any]],
+    markets: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Generate sample intents for a market maker.
+
+    Market makers typically place market-venue liquidity and move inventory where needed. In
+    this first pass we model that as:
+    - funding a general liquidity wallet
+    - posting a limit-style market trade on the spot venue
+    """
+    del pools
+    del markets
+    return [
+        build_player_intent(
+            player_id=player["player_id"],
+            intent_type=INTENT_TYPE_SYSTEM_TRANSFER,
+            parameters={
+                "recipient": make_address("liquidity_pool"),
+                "lamports": 2 * LAMPORTS_PER_SOL,
+            },
+            execution_preferences={
+                "message_format": LEGACY_TRANSACTION_FORMAT,
+                "compute_unit_price_micro_lamports": 10_000,
+            },
+            metadata={"intent_label": "fund_liquidity_pool"},
+        ),
+        build_player_intent(
+            player_id=player["player_id"],
+            intent_type=INTENT_TYPE_MARKET_TRADE,
+            venue_type="market",
+            venue_id="sol_usdc_spot",
+            parameters={
+                "side": MARKET_SIDE_SELL,
+                "order_type": MARKET_ORDER_TYPE_LIMIT,
+                "base_amount": 75_000_000,
+                "quote_amount_limit": 82_000_000,
+                "limit_price": 1_093_000,
+            },
+            execution_preferences={
+                "message_format": LEGACY_TRANSACTION_FORMAT,
+                "compute_unit_price_micro_lamports": 9_000,
+            },
+            metadata={"intent_label": "post_market_maker_offer"},
+        ),
+    ]
+
+
+def generate_liquidity_provider_intents(
+    player: dict[str, Any],
+    pools: dict[str, dict[str, Any]],
+    markets: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Generate sample intents for a liquidity provider.
+
+    LPs interact with pools rather than central-limit-order-book style markets. Their first
+    modeled behavior is adding inventory to a volatile constant-product pool.
+    """
+    del pools
+    del markets
+    return [
+        build_player_intent(
+            player_id=player["player_id"],
+            intent_type=INTENT_TYPE_POOL_LIQUIDITY_ADD,
+            venue_type="pool",
+            venue_id="volatile_sol_usdc",
+            parameters={
+                "max_token_amounts": [400_000_000, 900_000_000],
+                "min_lp_tokens_out": 150_000_000,
+                "lp_receipt_account": make_address("cp_lp_receipt_account"),
+            },
+            execution_preferences={
+                "message_format": LEGACY_TRANSACTION_FORMAT,
+                "compute_unit_price_micro_lamports": 8_000,
+            },
+            metadata={"intent_label": "provide_volatile_pool_liquidity"},
+        )
+    ]
+
+
+def generate_retail_user_intents(
+    player: dict[str, Any],
+    pools: dict[str, dict[str, Any]],
+    markets: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Generate sample intents for a retail user.
+
+    Retail flow is usually mixed: ordinary payments plus venue interaction. We model both a
+    merchant payment and a spot-market market order from the same player profile.
+    """
+    del pools
+    del markets
+    return [
+        build_player_intent(
+            player_id=player["player_id"],
+            intent_type=INTENT_TYPE_SYSTEM_TRANSFER,
+            parameters={
+                "recipient": make_address("merchant"),
+                "lamports": 250_000_000,
+            },
+            execution_preferences={
+                "message_format": LEGACY_TRANSACTION_FORMAT,
+                "compute_unit_price_micro_lamports": 0,
+            },
+            metadata={"intent_label": "merchant_payment"},
+        ),
+        build_player_intent(
+            player_id=player["player_id"],
+            intent_type=INTENT_TYPE_MARKET_TRADE,
+            venue_type="market",
+            venue_id="sol_usdc_spot",
+            parameters={
+                "side": MARKET_SIDE_BUY,
+                "order_type": MARKET_ORDER_TYPE_MARKET,
+                "base_amount": 120_000_000,
+                "quote_amount_limit": 125_000_000,
+                "limit_price": 0,
+            },
+            execution_preferences={
+                "message_format": VERSIONED_V0_TRANSACTION_FORMAT,
+                "lookup_table_account": make_address("market_alt"),
+                "compute_unit_price_micro_lamports": 6_000,
+            },
+            metadata={"intent_label": "spot_market_buy"},
+        ),
+    ]
+
+
+def generate_arbitrageur_intents(
+    player: dict[str, Any],
+    pools: dict[str, dict[str, Any]],
+    markets: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Generate sample intents for an arbitrageur.
+
+    Arbitrageurs care about fast pool-to-price dislocations, so they emit high-priority swap
+    flow against volatile pools.
+    """
+    del pools
+    del markets
+    return [
+        build_player_intent(
+            player_id=player["player_id"],
+            intent_type=INTENT_TYPE_POOL_SWAP,
+            venue_type="pool",
+            venue_id="volatile_sol_usdc",
+            parameters={
+                "source_symbol": "USDC",
+                "destination_symbol": "SOL",
+                "swap_mode": SWAP_MODE_EXACT_INPUT,
+                "amount": 250_000_000,
+                "other_amount_threshold": 120_000_000,
+            },
+            execution_preferences={
+                "message_format": LEGACY_TRANSACTION_FORMAT,
+                "compute_unit_price_micro_lamports": 10_000,
+            },
+            metadata={"intent_label": "arbitrage_pool_swap"},
+        )
+    ]
+
+
+def generate_router_intents(
+    player: dict[str, Any],
+    pools: dict[str, dict[str, Any]],
+    markets: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Generate sample intents for a router.
+
+    Routers optimize path selection and execution quality, so this sample sends a v0 stable-pool
+    swap using a lookup table and exact-output semantics.
+    """
+    del pools
+    del markets
+    return [
+        build_player_intent(
+            player_id=player["player_id"],
+            intent_type=INTENT_TYPE_POOL_SWAP,
+            venue_type="pool",
+            venue_id="stable_usdc_usdt",
+            parameters={
+                "source_symbol": "USDC",
+                "destination_symbol": "USDT",
+                "swap_mode": SWAP_MODE_EXACT_OUTPUT,
+                "amount": 100_000_000,
+                "other_amount_threshold": 100_200_000,
+            },
+            execution_preferences={
+                "message_format": VERSIONED_V0_TRANSACTION_FORMAT,
+                "lookup_table_account": make_address("stable_pool_alt"),
+                "compute_unit_price_micro_lamports": 5_000,
+            },
+            metadata={"intent_label": "stable_pool_swap"},
+        )
+    ]
+
+
+def generate_rebalancer_intents(
+    player: dict[str, Any],
+    pools: dict[str, dict[str, Any]],
+    markets: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Generate sample intents for a portfolio rebalancer.
+
+    Rebalancers trade toward target allocations rather than short-term prices, so this sample
+    interacts with the weighted multi-token pool.
+    """
+    del pools
+    del markets
+    return [
+        build_player_intent(
+            player_id=player["player_id"],
+            intent_type=INTENT_TYPE_POOL_SWAP,
+            venue_type="pool",
+            venue_id="weighted_sol_jup_usdc",
+            parameters={
+                "source_symbol": "USDC",
+                "destination_symbol": "SOL",
+                "swap_mode": SWAP_MODE_EXACT_INPUT,
+                "amount": 180_000_000,
+                "other_amount_threshold": 75_000_000,
+            },
+            execution_preferences={
+                "message_format": VERSIONED_V0_TRANSACTION_FORMAT,
+                "lookup_table_account": make_address("weighted_pool_alt"),
+                "compute_unit_price_micro_lamports": 7_500,
+            },
+            metadata={"intent_label": "weighted_pool_rebalance"},
+        )
+    ]
+
+
+PLAYER_INTENT_GENERATORS = {
+    PLAYER_TYPE_MARKET_MAKER: generate_market_maker_intents,
+    PLAYER_TYPE_LIQUIDITY_PROVIDER: generate_liquidity_provider_intents,
+    PLAYER_TYPE_RETAIL_USER: generate_retail_user_intents,
+    PLAYER_TYPE_ARBITRAGEUR: generate_arbitrageur_intents,
+    PLAYER_TYPE_ROUTER: generate_router_intents,
+    PLAYER_TYPE_REBALANCER: generate_rebalancer_intents,
+}
+
+
+def generate_player_intents(
+    players: dict[str, dict[str, Any]],
+    pools: dict[str, dict[str, Any]],
+    markets: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Generate player intents from player profiles.
+
+    This is the strategy layer entry point. Each player type uses its own generator, which means
+    market makers, LPs, retailers, routers, arbitrageurs, and rebalancers can all emit different
+    pre-transaction behavior before anything is compiled into Solana execution data.
+    """
+    intents: list[dict[str, Any]] = []
+    for player in players.values():
+        generator = PLAYER_INTENT_GENERATORS.get(player["player_type"])
+        if generator is None:
+            continue
+        intents.extend(generator(player, pools, markets))
+    return intents
 
 
 def default_compute_unit_limit(instructions: list[dict[str, Any]]) -> int:
@@ -942,96 +1733,458 @@ def create_block(
     return block
 
 
+def sample_pools() -> dict[str, dict[str, Any]]:
+    """
+    Build decoded sample pool definitions for the simulator.
+
+    These pool objects are not the raw on-chain account bytes. They are higher-level simulator
+    metadata describing which pricing curve each pool uses and which accounts belong to it.
+    This lets the same transaction layer support:
+    - volatile constant product pools
+    - stable swap pools
+    - weighted multi-token pools
+    """
+    return {
+        "volatile_sol_usdc": build_pool_definition(
+            pool_name="volatile_sol_usdc",
+            pool_type=POOL_TYPE_CONSTANT_PRODUCT,
+            pool_state_account=make_address("cp_sol_usdc_pool_state"),
+            pool_vault_accounts=[
+                make_address("cp_sol_vault"),
+                make_address("cp_usdc_vault"),
+            ],
+            pool_lp_mint=make_address("cp_lp_mint"),
+            pool_fee_vault=make_address("cp_fee_vault"),
+            token_symbols=["SOL", "USDC"],
+            oracle_account=make_address("volatile_oracle"),
+        ),
+        "stable_usdc_usdt": build_pool_definition(
+            pool_name="stable_usdc_usdt",
+            pool_type=POOL_TYPE_STABLE_SWAP,
+            pool_state_account=make_address("stable_usdc_usdt_pool_state"),
+            pool_vault_accounts=[
+                make_address("stable_usdc_vault"),
+                make_address("stable_usdt_vault"),
+            ],
+            pool_lp_mint=make_address("stable_lp_mint"),
+            pool_fee_vault=make_address("stable_fee_vault"),
+            token_symbols=["USDC", "USDT"],
+            oracle_account=make_address("stable_oracle"),
+            amplification_factor=120,
+        ),
+        "weighted_sol_jup_usdc": build_pool_definition(
+            pool_name="weighted_sol_jup_usdc",
+            pool_type=POOL_TYPE_WEIGHTED,
+            pool_state_account=make_address("weighted_sol_jup_usdc_pool_state"),
+            pool_vault_accounts=[
+                make_address("weighted_sol_vault"),
+                make_address("weighted_jup_vault"),
+                make_address("weighted_usdc_vault"),
+            ],
+            pool_lp_mint=make_address("weighted_lp_mint"),
+            pool_fee_vault=make_address("weighted_fee_vault"),
+            token_symbols=["SOL", "JUP", "USDC"],
+            oracle_account=make_address("weighted_oracle"),
+            normalized_weights_bps=[5_000, 2_000, 3_000],
+        ),
+    }
+
+
+def sample_markets() -> dict[str, dict[str, Any]]:
+    """
+    Build decoded sample market definitions for the simulator.
+
+    These are the orderbook-style venues that live next to the pool definitions so the
+    simulator can represent different classes of Solana trading venues at the same time.
+    """
+    return {
+        "sol_usdc_spot": build_market_definition(
+            market_name="sol_usdc_spot",
+            market_state_account=make_address("market_state"),
+            open_orders_account=make_address("open_orders"),
+            event_queue_account=make_address("event_queue"),
+            bids_account=make_address("bids"),
+            asks_account=make_address("asks"),
+            base_vault_account=make_address("sol_vault"),
+            quote_vault_account=make_address("usdc_vault"),
+            oracle_account=make_address("oracle"),
+            base_symbol="SOL",
+            quote_symbol="USDC",
+        )
+    }
+
+
+def sample_players() -> dict[str, dict[str, Any]]:
+    """
+    Build sample player profiles for the simulator.
+
+    These are strategy-level actors, not transactions. They hold the accounts they control and
+    later emit intents that get compiled into transaction requests.
+    """
+    return {
+        "player_market_maker": build_player_profile(
+            player_id="player_market_maker",
+            player_type=PLAYER_TYPE_MARKET_MAKER,
+            authority_account=make_address("market_maker"),
+            token_accounts={
+                "SOL": make_address("market_maker_sol_account"),
+                "USDC": make_address("market_maker_usdc_account"),
+            },
+            metadata={"style": "two_sided_liquidity"},
+        ),
+        "player_liquidity_provider": build_player_profile(
+            player_id="player_liquidity_provider",
+            player_type=PLAYER_TYPE_LIQUIDITY_PROVIDER,
+            authority_account=make_address("liquidity_provider"),
+            token_accounts={
+                "SOL": make_address("liquidity_provider_sol_account"),
+                "USDC": make_address("liquidity_provider_usdc_account"),
+            },
+            metadata={"style": "yield_seeking_lp"},
+        ),
+        "player_retail_trader": build_player_profile(
+            player_id="player_retail_trader",
+            player_type=PLAYER_TYPE_RETAIL_USER,
+            authority_account=make_address("retail_trader"),
+            token_accounts={
+                "SOL": make_address("retail_trader_sol_account"),
+                "USDC": make_address("retail_trader_usdc_account"),
+            },
+            default_message_format=VERSIONED_V0_TRANSACTION_FORMAT,
+            metadata={"style": "retail_flow"},
+        ),
+        "player_arb_bot": build_player_profile(
+            player_id="player_arb_bot",
+            player_type=PLAYER_TYPE_ARBITRAGEUR,
+            authority_account=make_address("arb_bot"),
+            token_accounts={
+                "SOL": make_address("arb_bot_sol_account"),
+                "USDC": make_address("arb_bot_usdc_account"),
+            },
+            metadata={"style": "latency_sensitive"},
+        ),
+        "player_stable_router": build_player_profile(
+            player_id="player_stable_router",
+            player_type=PLAYER_TYPE_ROUTER,
+            authority_account=make_address("stable_router"),
+            token_accounts={
+                "USDC": make_address("stable_router_usdc_account"),
+                "USDT": make_address("stable_router_usdt_account"),
+            },
+            default_message_format=VERSIONED_V0_TRANSACTION_FORMAT,
+            metadata={"style": "best_execution_router"},
+        ),
+        "player_index_rebalancer": build_player_profile(
+            player_id="player_index_rebalancer",
+            player_type=PLAYER_TYPE_REBALANCER,
+            authority_account=make_address("index_rebalancer"),
+            token_accounts={
+                "SOL": make_address("index_rebalancer_sol_account"),
+                "USDC": make_address("index_rebalancer_usdc_account"),
+                "JUP": make_address("index_rebalancer_jup_account"),
+            },
+            default_message_format=VERSIONED_V0_TRANSACTION_FORMAT,
+            metadata={"style": "portfolio_rebalance"},
+        ),
+    }
+
+
 def sample_accounts() -> dict[str, dict[str, Any]]:
     """
-    Build a small sample account set for the simulator.
+    Build a broad sample account set for the simulator.
 
-    These accounts are not meant to be exact replicas of mainnet accounts. They exist so the
-    sample transactions have realistic participants:
-    - user wallets that hold lamports and pay fees
-    - program-owned state accounts for the market
-    - token-vault-like writable accounts
-    - an address lookup table account for the v0 example
-    - the executable program account itself
+    These accounts are meant to support multiple interacting venue types:
+    - regular wallets such as market makers, retail traders, merchants, and LPs
+    - token accounts used by both pool swaps and market-based trading
+    - pool state accounts owned by the AMM program
+    - orderbook-style market accounts such as open orders, bids, asks, and event queue
+    - lookup table accounts for v0 transaction examples
+    - executable program accounts for both venue types
     """
     accounts = {
-        # Market maker wallet that funds liquidity movements and pays fees.
+        # Earlier high-level participants kept in the simulation because they are useful actor archetypes.
         make_address("market_maker"): build_account_state(
             lamports=25 * LAMPORTS_PER_SOL,
             owner=SYSTEM_PROGRAM_ID,
         ),
-        # Destination pool account that receives transferred liquidity.
         make_address("liquidity_pool"): build_account_state(
             lamports=100 * LAMPORTS_PER_SOL,
             owner=SYSTEM_PROGRAM_ID,
         ),
-        # Retail trader wallet used as the fee payer and signer in the swap example.
         make_address("retail_trader"): build_account_state(
             lamports=8 * LAMPORTS_PER_SOL,
             owner=SYSTEM_PROGRAM_ID,
         ),
-        # Simple recipient wallet included to show a normal user-owned system account.
         make_address("merchant"): build_account_state(
             lamports=3 * LAMPORTS_PER_SOL,
             owner=SYSTEM_PROGRAM_ID,
         ),
-        # Program-owned order state for the simulated market program.
+        # Trader authority wallets. These are normal system accounts used to sign transactions.
+        make_address("arb_bot"): build_account_state(
+            lamports=12 * LAMPORTS_PER_SOL,
+            owner=SYSTEM_PROGRAM_ID,
+        ),
+        make_address("stable_router"): build_account_state(
+            lamports=10 * LAMPORTS_PER_SOL,
+            owner=SYSTEM_PROGRAM_ID,
+        ),
+        make_address("index_rebalancer"): build_account_state(
+            lamports=14 * LAMPORTS_PER_SOL,
+            owner=SYSTEM_PROGRAM_ID,
+        ),
+        # Liquidity provider wallet kept here as a foundation for later LP behavior simulation.
+        make_address("liquidity_provider"): build_account_state(
+            lamports=30 * LAMPORTS_PER_SOL,
+            owner=SYSTEM_PROGRAM_ID,
+        ),
+        # Trader token accounts. In a real Solana deployment these would normally be owned by
+        # the SPL Token program and hold fungible token balances rather than arbitrary program state.
+        make_address("arb_bot_sol_account"): build_account_state(
+            lamports=1_500_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[1, 0, 0, 0],
+        ),
+        make_address("arb_bot_usdc_account"): build_account_state(
+            lamports=4_000_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[2, 0, 0, 0],
+        ),
+        make_address("stable_router_usdc_account"): build_account_state(
+            lamports=8_000_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[3, 0, 0, 0],
+        ),
+        make_address("stable_router_usdt_account"): build_account_state(
+            lamports=8_000_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[4, 0, 0, 0],
+        ),
+        make_address("index_rebalancer_usdc_account"): build_account_state(
+            lamports=9_000_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[5, 0, 0, 0],
+        ),
+        make_address("index_rebalancer_sol_account"): build_account_state(
+            lamports=2_500_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[6, 0, 0, 0],
+        ),
+        make_address("index_rebalancer_jup_account"): build_account_state(
+            lamports=7_000_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[7, 0, 0, 0],
+        ),
+        # Token accounts for the restored market-maker and retail-trader participants.
+        make_address("market_maker_sol_account"): build_account_state(
+            lamports=6_000_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[7, 1, 0, 0],
+        ),
+        make_address("market_maker_usdc_account"): build_account_state(
+            lamports=25_000_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[7, 2, 0, 0],
+        ),
+        make_address("retail_trader_sol_account"): build_account_state(
+            lamports=1_200_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[7, 3, 0, 0],
+        ),
+        make_address("retail_trader_usdc_account"): build_account_state(
+            lamports=5_500_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[7, 4, 0, 0],
+        ),
+        make_address("liquidity_provider_sol_account"): build_account_state(
+            lamports=9_000_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[7, 5, 0, 0],
+        ),
+        make_address("liquidity_provider_usdc_account"): build_account_state(
+            lamports=18_000_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[7, 6, 0, 0],
+        ),
+        # LP receipt accounts are included so later we can model LP share balances and behavior.
+        make_address("cp_lp_receipt_account"): build_account_state(
+            lamports=500_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[8, 0],
+        ),
+        make_address("stable_lp_receipt_account"): build_account_state(
+            lamports=500_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[9, 0],
+        ),
+        make_address("weighted_lp_receipt_account"): build_account_state(
+            lamports=500_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[10, 0],
+        ),
+        # Constant product pool state and reserves for a volatile SOL/USDC pool.
+        make_address("cp_sol_usdc_pool_state"): build_account_state(
+            lamports=3 * LAMPORTS_PER_SOL,
+            owner=AMM_SIM_PROGRAM_ID,
+            data=[11, 1, 0, 1],
+        ),
+        make_address("cp_sol_vault"): build_account_state(
+            lamports=80 * LAMPORTS_PER_SOL,
+            owner=TOKEN_PROGRAM_ID,
+            data=[12, 1],
+        ),
+        make_address("cp_usdc_vault"): build_account_state(
+            lamports=140_000_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[13, 1],
+        ),
+        make_address("cp_lp_mint"): build_account_state(
+            lamports=2_000_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[14, 1],
+        ),
+        make_address("cp_fee_vault"): build_account_state(
+            lamports=300_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[15, 1],
+        ),
+        # Stable swap pool state and reserves. This pool can later use an amplification factor.
+        make_address("stable_usdc_usdt_pool_state"): build_account_state(
+            lamports=3 * LAMPORTS_PER_SOL,
+            owner=AMM_SIM_PROGRAM_ID,
+            data=[21, 2, 0, 1],
+        ),
+        make_address("stable_usdc_vault"): build_account_state(
+            lamports=250_000_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[22, 2],
+        ),
+        make_address("stable_usdt_vault"): build_account_state(
+            lamports=248_000_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[23, 2],
+        ),
+        make_address("stable_lp_mint"): build_account_state(
+            lamports=2_500_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[24, 2],
+        ),
+        make_address("stable_fee_vault"): build_account_state(
+            lamports=400_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[25, 2],
+        ),
+        # Weighted multi-token pool state and reserves for a three-asset basket.
+        make_address("weighted_sol_jup_usdc_pool_state"): build_account_state(
+            lamports=4 * LAMPORTS_PER_SOL,
+            owner=AMM_SIM_PROGRAM_ID,
+            data=[31, 3, 0, 1],
+        ),
+        make_address("weighted_sol_vault"): build_account_state(
+            lamports=60 * LAMPORTS_PER_SOL,
+            owner=TOKEN_PROGRAM_ID,
+            data=[32, 3],
+        ),
+        make_address("weighted_jup_vault"): build_account_state(
+            lamports=90_000_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[33, 3],
+        ),
+        make_address("weighted_usdc_vault"): build_account_state(
+            lamports=110_000_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[34, 3],
+        ),
+        make_address("weighted_lp_mint"): build_account_state(
+            lamports=2_800_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[35, 3],
+        ),
+        make_address("weighted_fee_vault"): build_account_state(
+            lamports=450_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[36, 3],
+        ),
+        # Orderbook-style market accounts restored so the simulation can support market-based trading.
         make_address("open_orders"): build_account_state(
             lamports=2 * LAMPORTS_PER_SOL,
             owner=MARKET_SIM_PROGRAM_ID,
-            data=[1, 2, 3, 4],
+            data=[61, 1, 0, 0],
         ),
-        # Writable queue-like state where simulated fills or events would accumulate.
         make_address("event_queue"): build_account_state(
             lamports=4 * LAMPORTS_PER_SOL,
             owner=MARKET_SIM_PROGRAM_ID,
-            data=[9, 8, 7],
+            data=[62, 1, 0, 0],
         ),
-        # Read-mostly market configuration/state account.
         make_address("market_state"): build_account_state(
             lamports=5 * LAMPORTS_PER_SOL,
             owner=MARKET_SIM_PROGRAM_ID,
-            data=[10, 20, 30],
+            data=[63, 1, 0, 0],
         ),
-        # Sample bids slab/account for the order book side.
         make_address("bids"): build_account_state(
             lamports=2 * LAMPORTS_PER_SOL,
             owner=MARKET_SIM_PROGRAM_ID,
-            data=[5],
+            data=[64, 1, 0, 0],
         ),
-        # Sample asks slab/account for the order book side.
         make_address("asks"): build_account_state(
             lamports=2 * LAMPORTS_PER_SOL,
             owner=MARKET_SIM_PROGRAM_ID,
-            data=[6],
+            data=[65, 1, 0, 0],
         ),
-        # Oracle-like price reference account used read-only by the market instruction.
         make_address("oracle"): build_account_state(
             lamports=LAMPORTS_PER_SOL,
             owner=MARKET_SIM_PROGRAM_ID,
-            data=[42, 42],
+            data=[66, 1, 0, 0],
         ),
-        # Writable vault-like account representing one side of the market inventory.
         make_address("usdc_vault"): build_account_state(
-            lamports=20 * LAMPORTS_PER_SOL,
-            owner=MARKET_SIM_PROGRAM_ID,
-            data=[11, 12],
+            lamports=120_000_000_000,
+            owner=TOKEN_PROGRAM_ID,
+            data=[67, 1, 0, 0],
         ),
-        # Writable vault-like account representing the other side of the market inventory.
         make_address("sol_vault"): build_account_state(
-            lamports=15 * LAMPORTS_PER_SOL,
-            owner=MARKET_SIM_PROGRAM_ID,
-            data=[13, 14],
+            lamports=70 * LAMPORTS_PER_SOL,
+            owner=TOKEN_PROGRAM_ID,
+            data=[68, 1, 0, 0],
         ),
-        # Address Lookup Table account used by the v0 example to compress account references.
+        # Optional oracle-style accounts that later simulations can use for pricing or guard rails.
+        make_address("volatile_oracle"): build_account_state(
+            lamports=LAMPORTS_PER_SOL,
+            owner=AMM_SIM_PROGRAM_ID,
+            data=[41, 1],
+        ),
+        make_address("stable_oracle"): build_account_state(
+            lamports=LAMPORTS_PER_SOL,
+            owner=AMM_SIM_PROGRAM_ID,
+            data=[42, 1],
+        ),
+        make_address("weighted_oracle"): build_account_state(
+            lamports=LAMPORTS_PER_SOL,
+            owner=AMM_SIM_PROGRAM_ID,
+            data=[43, 1],
+        ),
+        # Address lookup table accounts used by the v0 examples to compress non-signer pool references.
+        make_address("stable_pool_alt"): build_account_state(
+            lamports=2_000_000,
+            owner=ADDRESS_LOOKUP_TABLE_PROGRAM_ID,
+            data=[51, 1],
+        ),
+        make_address("weighted_pool_alt"): build_account_state(
+            lamports=2_000_000,
+            owner=ADDRESS_LOOKUP_TABLE_PROGRAM_ID,
+            data=[52, 1],
+        ),
         make_address("market_alt"): build_account_state(
             lamports=2_000_000,
             owner=ADDRESS_LOOKUP_TABLE_PROGRAM_ID,
-            data=[99, 100],
+            data=[53, 1],
         ),
-        # This final entry is the executable program account itself. Its owner is the
-        # upgradeable BPF loader, which is the loader program responsible for storing and
-        # dispatching upgradeable Solana programs.
+        # The executable AMM program account itself. Its owner is the upgradeable BPF loader,
+        # which is the loader program responsible for storing and dispatching upgradeable Solana programs.
+        AMM_SIM_PROGRAM_ID: build_account_state(
+            lamports=5 * LAMPORTS_PER_SOL,
+            owner="BPFLoaderUpgradeable11111111111111111111111",
+            executable=True,
+        ),
+        # The executable market program account for orderbook-style trading instructions.
         MARKET_SIM_PROGRAM_ID: build_account_state(
             lamports=5 * LAMPORTS_PER_SOL,
             owner="BPFLoaderUpgradeable11111111111111111111111",
@@ -1041,57 +2194,27 @@ def sample_accounts() -> dict[str, dict[str, Any]]:
     return accounts
 
 
-def sample_transaction_requests() -> list[dict[str, Any]]:
-    market_lookup_table = build_address_lookup_table(
-        account_key=make_address("market_alt"),
-        addresses=[
-            make_address("event_queue"),
-            make_address("market_state"),
-            make_address("bids"),
-            make_address("asks"),
-            make_address("oracle"),
-        ],
-    )
+def sample_player_intents(
+    players: dict[str, dict[str, Any]],
+    pools: dict[str, dict[str, Any]],
+    markets: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Build sample high-level intents emitted by different player types.
 
-    return [
-        build_transaction_request(
-            agent_id="agent_market_maker",
-            fee_payer=make_address("market_maker"),
-            instructions=[
-                build_system_transfer_instruction(
-                    sender=make_address("market_maker"),
-                    recipient=make_address("liquidity_pool"),
-                    lamports=2 * LAMPORTS_PER_SOL,
-                )
-            ],
-            message_format=LEGACY_TRANSACTION_FORMAT,
-            compute_unit_price_micro_lamports=10_000,
-            metadata={"intent": "rebalance_pool"},
-        ),
-        build_transaction_request(
-            agent_id="agent_retail_trader",
-            fee_payer=make_address("retail_trader"),
-            instructions=[
-                build_market_swap_instruction(
-                    trader=make_address("retail_trader"),
-                    open_orders=make_address("open_orders"),
-                    event_queue=make_address("event_queue"),
-                    market_state=make_address("market_state"),
-                    bids=make_address("bids"),
-                    asks=make_address("asks"),
-                    oracle=make_address("oracle"),
-                    usdc_vault=make_address("usdc_vault"),
-                    sol_vault=make_address("sol_vault"),
-                    amount_in=250_000_000,
-                    min_amount_out=249_000_000,
-                )
-            ],
-            message_format=VERSIONED_V0_TRANSACTION_FORMAT,
-            address_lookup_tables=[market_lookup_table],
-            compute_unit_price_micro_lamports=5_000,
-            metadata={"intent": "swap_usdc_for_sol"},
-        ),
-    ]
+    This keeps the main demo flow explicit:
+    players -> player intents -> transaction requests -> executed transactions -> blocks
+    """
+    return generate_player_intents(players, pools, markets)
+
+
+def sample_transaction_requests(
+    player_intents: list[dict[str, Any]],
+    players: dict[str, dict[str, Any]],
+    pools: dict[str, dict[str, Any]],
+    markets: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return compile_player_intents_to_requests(player_intents, players, pools, markets)
 
 
 def sample_block_from_requests(
@@ -1113,10 +2236,26 @@ def sample_block_from_requests(
 
 
 def main() -> None:
+    pools = sample_pools()
+    markets = sample_markets()
+    players = sample_players()
+    player_intents = sample_player_intents(players, pools, markets)
     accounts = sample_accounts()
-    requests = sample_transaction_requests()
+    requests = sample_transaction_requests(player_intents, players, pools, markets)
     block = sample_block_from_requests(requests)
 
+    print("POOLS")
+    print(to_json(pools))
+    print()
+    print("MARKETS")
+    print(to_json(markets))
+    print()
+    print("PLAYERS")
+    print(to_json(players))
+    print()
+    print("PLAYER INTENTS")
+    print(to_json(player_intents))
+    print()
     print("ACCOUNTS")
     print(to_json(accounts))
     print()
