@@ -25,6 +25,10 @@ First simulation layer for a Solana-like blockchain.
 
 Use Python dictionaries as the in-memory source of truth.
 Serialize them to JSON only when saving to disk, sending over HTTP, or printing.
+
+Always be wary of when a function expects raw bytes or hex strings. Solana protocol sizes are based on byte lengths,
+but for readability we often use hex strings in the simulator. When estimating transaction sizes, be sure to use the 
+underlying byte lengths and not the string lengths of any hex-encoded values.
 """
 
 import hashlib
@@ -249,11 +253,17 @@ def encode_system_transfer_data(lamports: int) -> list[int]:
     # We use `struct.pack` because Solana instruction data is binary, not JSON.
     # "<IQ" means little-endian: `I` = 4-byte unsigned int for the System Program
     # instruction discriminator, and `Q` = 8-byte unsigned long long for lamports.
+    # the number 2 is the System Program's "Transfer" instruction discriminator, which tells the program which action to perform.
     return list(struct.pack("<IQ", 2, lamports))
 
 
 def encode_market_swap_data(side: str, amount_in: int, min_amount_out: int) -> list[int]:
-    side_flag = 0 if side == "buy" else 1
+    if side == "buy":
+        side_flag = 0
+    elif side == "sell":
+        side_flag = 1
+    else:
+        raise ValueError("side must be 'buy' or 'sell'")
     # We use `struct.pack` to produce deterministic binary instruction data.
     # "<BQQ" means little-endian: `B` = 1-byte side flag, then two `Q` values for the
     # 8-byte unsigned integers `amount_in` and `min_amount_out`.
