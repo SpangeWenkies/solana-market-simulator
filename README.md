@@ -7,13 +7,13 @@ Aims/todos:
 - create chain that stores subsequent blocks
 - create proof of stake algorithm
 - create proof of history algorithm (maybe this is the same as verifying the chain is valid)
-- create a way to add new transactions to the chain
+- create a way to add new transactions to the chain (partially done?)
 - create a way to verify the chain is valid
 - create a way to resolve conflicts between chains
 - create a way to register nodes in the network
 - create a way to reach consensus between nodes
-- replace fixed sample generators with state-driven ones so they react to pool prices, inventory, spreads, and validator conditions instead of emitting hard-coded intents
-- create liquidity pools and a way to swap between them
+- replace fixed sample generators with state-driven ones so they react to pool prices, inventory, spreads, and validator conditions instead of emitting hard-coded intents (partially done?)
+- create liquidity pools and a way to swap between them (done?)
 - create a random transaction request loop to test the blockchain
 - create transaction data using benford's law to simulate real-world transactions
 - create statistics such as total number of transactions, total value of transactions, average transaction value, etc. to analyze the blockchain data and see if it follows expected patterns.
