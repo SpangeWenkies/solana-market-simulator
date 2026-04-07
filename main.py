@@ -45,6 +45,11 @@ RUNTIME_MAX_ACCOUNTS_PER_TRANSACTION = 64
 MAX_SIGNATURES_PER_PACKET = 12
 MAX_PROCESSING_AGE = 150
 
+PUBKEY_BYTES = 32
+BLOCKHASH_BYTES = 32
+HASH_BYTES = 32
+SIGNATURE_BYTES = 64
+
 DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT = 200_000
 MAX_BUILTIN_ALLOCATION_COMPUTE_UNIT_LIMIT = 3_000
 MAX_COMPUTE_UNIT_LIMIT = 1_400_000
@@ -93,9 +98,21 @@ def make_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex}"
 
 
+def placeholder_digest_hex(payload: bytes, digest_size_bytes: int) -> str:
+    """
+    Return a hex-encoded placeholder digest of a specific byte width.
+
+    The digest width is expressed in bytes because Solana protocol sizes are byte-based.
+    The returned string is hex text for readability, so its Python string length is twice
+    the underlying byte length. Code that estimates protocol size must therefore use the
+    byte-width constants above, not `len()` of the returned hex string.
+    """
+    return hashlib.blake2b(payload, digest_size=digest_size_bytes).hexdigest()
+
+
 def stable_hash(payload: Any) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return placeholder_digest_hex(encoded, HASH_BYTES)
 
 
 def to_json(data: Any) -> str:
@@ -145,7 +162,7 @@ def simulate_signature_for_signer(message: dict[str, Any], signer_pubkey: str) -
     payload += signer_pubkey.encode("utf-8")
     # We use blake2b here as a fast deterministic placeholder for a real Ed25519 signature.
     # This is not how Solana actually signs transactions; it is only a simulator-friendly stand-in.
-    return hashlib.blake2b(payload, digest_size=64).hexdigest()
+    return placeholder_digest_hex(payload, SIGNATURE_BYTES)
 
 
 def transaction_hash(transaction: dict[str, Any]) -> str:
@@ -719,11 +736,11 @@ def estimate_legacy_transaction_size(transaction: dict[str, Any]) -> int:
 
     Formula:
     - shortvec length of the signature count
-    - 64 bytes per signature
+    - `SIGNATURE_BYTES` bytes per signature
     - 3 bytes for the message header fields
     - shortvec length of the account key count
-    - 32 bytes per account key
-    - 32 bytes for the recent blockhash
+    - `PUBKEY_BYTES` bytes per account key
+    - `BLOCKHASH_BYTES` bytes for the recent blockhash
     - shortvec length of the instruction count
     - size of each compiled instruction
 
@@ -740,8 +757,8 @@ def estimate_legacy_transaction_size(transaction: dict[str, Any]) -> int:
     message_size = (
         3
         + shortvec_length(len(message["account_keys"]))
-        + (32 * len(message["account_keys"]))
-        + 32
+        + (PUBKEY_BYTES * len(message["account_keys"]))
+        + BLOCKHASH_BYTES
         + shortvec_length(len(message["instructions"]))
         + sum(
             estimate_compiled_instruction_size(compiled_instruction)
@@ -749,7 +766,7 @@ def estimate_legacy_transaction_size(transaction: dict[str, Any]) -> int:
         )
     )
     return shortvec_length(len(transaction["signatures"])) + (
-        64 * len(transaction["signatures"])
+        SIGNATURE_BYTES * len(transaction["signatures"])
     ) + message_size
 
 
@@ -759,16 +776,16 @@ def estimate_v0_transaction_size(transaction: dict[str, Any]) -> int:
 
     Formula:
     - shortvec length of the signature count
-    - 64 bytes per signature
+    - `SIGNATURE_BYTES` bytes per signature
     - 1 byte for the version prefix
     - 3 bytes for the message header fields
     - shortvec length of the static account key count
-    - 32 bytes per static account key
-    - 32 bytes for the recent blockhash
+    - `PUBKEY_BYTES` bytes per static account key
+    - `BLOCKHASH_BYTES` bytes for the recent blockhash
     - shortvec length of the instruction count
     - size of each compiled instruction
     - shortvec length of the address table lookup count
-    - for each lookup: 32 bytes for the lookup table address plus shortvec-prefixed writable
+    - for each lookup: `PUBKEY_BYTES` bytes for the lookup table address plus shortvec-prefixed writable
       and readonly index arrays
       
     A lookup table is added, so some account keys are moved from the static account key list into the address table lookups section. 
@@ -784,7 +801,7 @@ def estimate_v0_transaction_size(transaction: dict[str, Any]) -> int:
     message = transaction["message"]
     lookup_size = shortvec_length(len(message["address_table_lookups"]))
     for lookup in message["address_table_lookups"]:
-        lookup_size += 32
+        lookup_size += PUBKEY_BYTES
         lookup_size += shortvec_length(len(lookup["writable_indexes"])) + len(lookup["writable_indexes"])
         lookup_size += shortvec_length(len(lookup["readonly_indexes"])) + len(lookup["readonly_indexes"])
 
@@ -792,8 +809,8 @@ def estimate_v0_transaction_size(transaction: dict[str, Any]) -> int:
         1
         + 3
         + shortvec_length(len(message["static_account_keys"]))
-        + (32 * len(message["static_account_keys"]))
-        + 32
+        + (PUBKEY_BYTES * len(message["static_account_keys"]))
+        + BLOCKHASH_BYTES
         + shortvec_length(len(message["instructions"]))
         + sum(
             estimate_compiled_instruction_size(compiled_instruction)
@@ -802,7 +819,7 @@ def estimate_v0_transaction_size(transaction: dict[str, Any]) -> int:
         + lookup_size
     )
     return shortvec_length(len(transaction["signatures"])) + (
-        64 * len(transaction["signatures"])
+        SIGNATURE_BYTES * len(transaction["signatures"])
     ) + message_size
 
 
