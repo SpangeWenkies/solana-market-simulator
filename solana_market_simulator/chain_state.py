@@ -1,4 +1,11 @@
-"""Chain state, execution, scheduling, and summary helpers."""
+"""Persistent blockchain state and runtime execution helpers.
+
+This module owns the live chain state object plus the functions that mutate it:
+- chain construction and timing config
+- player and validator registration/status
+- leader scheduling and skipped-slot logic
+- mempool selection, transaction application, block production, and summaries
+"""
 
 import math
 import struct

@@ -1,8 +1,8 @@
-"""
-Core constants for the Solana market simulator.
+"""Central constant definitions for the simulator.
 
-These values are grouped separately so the rest of the package can import one consistent source
-of protocol sizes, simulator defaults, player types, policy names, and program identifiers.
+This file holds protocol byte sizes, simulator defaults, program identifiers, player/policy
+names, pool/market types, and other shared enums/constants so the rest of the codebase can
+import one consistent source of truth.
 """
 
 LAMPORTS_PER_SOL = 1_000_000_000

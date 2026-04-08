@@ -1,6 +1,6 @@
 """Compatibility facade for the former mixed `core` module.
 
-Internal code should import from:
+This file exists so older imports still work after the refactor. New code should import from:
 - `domain.py` for market/player/validator definitions and intent compilation
 - `policies.py` for state-driven policy logic
 - `simulation.py` for the multi-slot simulation loop

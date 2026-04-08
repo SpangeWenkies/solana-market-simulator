@@ -1,4 +1,8 @@
-"""Sample fixtures and demo helpers for the simulator."""
+"""Sample fixtures and demo-oriented helper flows.
+
+This file provides the example pools, markets, accounts, players, validators, and a few
+helper functions used by the demo runner to bootstrap a readable simulation scenario.
+"""
 
 from .constants import (
     ADDRESS_LOOKUP_TABLE_PROGRAM_ID,

@@ -1,4 +1,8 @@
-"""Domain builders and intent-to-request compilation."""
+"""Domain-level builders and intent compilation.
+
+This module defines the higher-level market/pool/player/validator objects used by the
+simulation layer and converts player intents into concrete transaction requests.
+"""
 
 from copy import deepcopy
 from typing import Any

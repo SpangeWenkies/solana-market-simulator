@@ -1,4 +1,8 @@
-"""Simulation-loop orchestration."""
+"""Multi-slot simulation orchestration.
+
+This module runs the chain forward over slots and epochs by asking policies for new requests,
+submitting them, handling skipped slots, producing blocks, and returning a run summary.
+"""
 
 from typing import Any
 

@@ -1,4 +1,8 @@
-"""Replay-based chain verification helpers."""
+"""Replay-based chain verification.
+
+This module rebuilds chain state from the stored base state and archived requests so it can
+verify produced blocks, skipped slots, and final state consistency against the live chain.
+"""
 
 from copy import deepcopy
 from typing import Any

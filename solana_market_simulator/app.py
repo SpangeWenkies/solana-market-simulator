@@ -1,4 +1,8 @@
-"""Application entry point for the simulator demo."""
+"""Demo application runner.
+
+This file wires together sample fixtures, runtime registration, the simulation loop,
+and the printed JSON summaries used for manual inspection of the simulator.
+"""
 
 from .constants import DEFAULT_SLOTS_PER_EPOCH
 from .chain_state import (

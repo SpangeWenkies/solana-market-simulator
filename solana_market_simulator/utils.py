@@ -1,8 +1,7 @@
-"""
-Utility helpers shared across the simulator.
+"""Generic utility helpers shared across the simulator.
 
-These are intentionally kept independent of the higher-level blockchain engine so they can be
-imported from any module without creating architectural cycles.
+This file contains small reusable helpers such as hashing, UUID-based ids, JSON formatting,
+addresses, and shortvec sizing. It stays independent of the blockchain engine to avoid cycles.
 """
 
 import hashlib

@@ -1,4 +1,8 @@
-"""State-driven player policies and request generation."""
+"""State-driven player strategy logic.
+
+This file holds pricing helpers, policy cadence helpers, concrete player policy
+implementations, and the functions that turn live chain state into fresh requests for a slot.
+"""
 
 from copy import deepcopy
 from typing import Any

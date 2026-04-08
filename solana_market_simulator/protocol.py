@@ -1,4 +1,11 @@
-"""Protocol-level primitives for accounts, instructions, transactions, and blocks."""
+"""Low-level Solana-like protocol primitives.
+
+This module holds the building blocks closest to the wire/runtime model:
+- account and instruction shapes
+- instruction encoding/decoding
+- transaction request compilation and sizing
+- materialized transactions and block assembly
+"""
 
 import struct
 from copy import deepcopy
