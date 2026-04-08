@@ -16,7 +16,7 @@ from .chain_state import (
     validator_is_schedulable_for_epoch,
     verify_block_parent_link,
 )
-from .transactions import materialize_transaction
+from .protocol import materialize_transaction
 from .utils import stable_hash
 
 

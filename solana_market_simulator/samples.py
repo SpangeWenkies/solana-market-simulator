@@ -33,15 +33,17 @@ from .chain_state import (
     register_validator,
     submit_transaction_request,
 )
-from .core import (
+from .domain import (
     build_market_definition,
     build_player_profile,
     build_pool_definition,
     build_validator_profile,
     compile_player_intents_to_requests,
+)
+from .policies import (
     generate_player_intents,
 )
-from .transactions import build_account_state
+from .protocol import build_account_state
 from .utils import make_address
 
 

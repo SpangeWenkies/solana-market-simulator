@@ -35,7 +35,7 @@ from .constants import (
     VOTE_PROGRAM_ID,
     WEIGHTED_SWAP_FEE_BPS,
 )
-from .transactions import (
+from .protocol import (
     build_account_state,
     build_request_scheduling_profile,
     create_block,

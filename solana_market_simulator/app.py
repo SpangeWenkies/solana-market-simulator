@@ -9,7 +9,6 @@ from .chain_state import (
     summarize_blocks,
     summarize_skipped_slots,
 )
-from .core import run_simulation
 from .samples import (
     sample_accounts,
     sample_markets,
@@ -18,6 +17,7 @@ from .samples import (
     sample_pools,
     sample_validators,
 )
+from .simulation import run_simulation
 from .utils import to_json
 from .verification import verify_chain
 
